@@ -43,18 +43,15 @@ async def price_report(req: PriceReportRequest, request: Request):
         return_exceptions=True
     )
 
-    # 如果 gather 返回 exception object，當作 None
-    if isinstance(yuyu_result, Exception):
-        yuyu_result = None
-    if isinstance(pc_result, Exception):
-        pc_result = None
-    if isinstance(rates, Exception):
+    # 如果 gather 返回 exception object，記錄但繼續
+    yuyu_error = str(yuyu_result) if isinstance(yuyu_result, Exception) else None
+    pc_error   = str(pc_result)   if isinstance(pc_result,   Exception) else None
+
+    if isinstance(yuyu_result, Exception): yuyu_result = None
+    if isinstance(pc_result,   Exception): pc_result   = None
+    if isinstance(rates,       Exception):
         from utils.exchange_rate import FALLBACK
         rates = FALLBACK
-
-    # 全部 source 失敗
-    if yuyu_result is None and pc_result is None:
-        raise HTTPException(status_code=503, detail="All price sources failed")
 
     # 加 HKD 到各 source
     yuyu_out = None
@@ -100,6 +97,10 @@ async def price_report(req: PriceReportRequest, request: Request):
     card_label = f"{req.card_name} {req.rarity} {req.card_number}".strip()
     now_hkt    = datetime.now(HKT)
 
+    errors = {}
+    if yuyu_error:  errors["yuyu_tei"]      = yuyu_error
+    if pc_error:    errors["pricecharting"] = pc_error
+
     report = {
         "card_name":      card_label,
         "timestamp":      now_hkt.isoformat(),
@@ -112,6 +113,7 @@ async def price_report(req: PriceReportRequest, request: Request):
         },
         "summary":        summary,
         "exchange_rates": rates,
+        "errors":         errors if errors else None,
         "tg_message":     _format_tg(card_label, now_hkt, yuyu_out, pc_out, summary, req),
     }
 

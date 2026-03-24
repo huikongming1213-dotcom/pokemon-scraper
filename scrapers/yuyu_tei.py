@@ -12,7 +12,7 @@ async def scrape(browser, card_number: str) -> dict | None:
     """
     page = await browser.new_page()
     try:
-        await page.goto("https://yuyu-tei.jp/sell/poc/s/search", timeout=10000)
+        await page.goto("https://yuyu-tei.jp/sell/poc/s/search")  # default 30s timeout
 
         inputs = page.locator('input[name="search_word"]')
         count = await inputs.count()
@@ -28,7 +28,7 @@ async def scrape(browser, card_number: str) -> dict | None:
         if not filled:
             return None
 
-        await page.wait_for_load_state("networkidle", timeout=15000)
+        await page.wait_for_load_state("networkidle", timeout=25000)
 
         cards = await page.query_selector_all(".card-product")
         if not cards:
