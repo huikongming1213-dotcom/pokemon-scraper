@@ -6,7 +6,8 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 RUN playwright install chromium --with-deps
 
-COPY api.py .
+# Copy entire project (not just api.py)
+COPY . .
 
 EXPOSE 8080
 

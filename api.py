@@ -2,6 +2,8 @@ from contextlib import asynccontextmanager
 from fastapi import FastAPI, HTTPException, Query
 from playwright.async_api import async_playwright, Playwright
 
+from routers.price_report import router as price_report_router
+
 
 # ── Browser lifecycle (shared across requests) ────────────────────────────────
 
@@ -14,22 +16,23 @@ async def lifespan(app: FastAPI):
     global _pw, _browser
     _pw = await async_playwright().start()
     _browser = await _pw.chromium.launch(headless=True)
+    app.state.browser = _browser   # 讓 routers 可以 access
     yield
     await _browser.close()
     await _pw.stop()
 
 
-app = FastAPI(title="YuyuTei Card Scraper", lifespan=lifespan)
+app = FastAPI(title="Pokemon Card Price Scraper", lifespan=lifespan)
+app.include_router(price_report_router)
 
 
-# ── Scraping logic ────────────────────────────────────────────────────────────
+# ── 現有 endpoint（保留，唔改）────────────────────────────────────────────────
 
 async def scrape_cards(card_number: str) -> list[dict]:
     page = await _browser.new_page()
     try:
         await page.goto("https://yuyu-tei.jp/sell/poc/s/search")
 
-        # Fill the first visible search input
         inputs = page.locator('input[name="search_word"]')
         count = await inputs.count()
         filled = False
@@ -59,8 +62,6 @@ async def scrape_cards(card_number: str) -> list[dict]:
     finally:
         await page.close()
 
-
-# ── Endpoint ──────────────────────────────────────────────────────────────────
 
 @app.get("/search")
 async def search(
