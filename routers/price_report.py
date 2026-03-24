@@ -7,6 +7,7 @@ from datetime import datetime, timezone, timedelta
 from fastapi import APIRouter, HTTPException, Request
 from pydantic import BaseModel
 
+import re
 from scrapers import yuyu_tei
 from apis import pricecharting
 from utils.exchange_rate import get_rates, jpy_to_hkd, usd_to_hkd
@@ -29,12 +30,27 @@ class PriceReportRequest(BaseModel):
 
 # ── Endpoint ──────────────────────────────────────────────────────────────────
 
+async def _yuyu_via_search(app, card_number: str) -> dict | None:
+    """直接用 api.py 嘅 scrape_cards 邏輯，確保同 /search endpoint 行為一致"""
+    import api as main_api
+    results = await main_api.scrape_cards(card_number)
+    if not results:
+        return None
+    for r in results:
+        price_str = r.get("price")
+        if price_str:
+            digits = re.sub(r"[^\d]", "", price_str)
+            if digits:
+                return {"price_jpy": int(digits), "name": r.get("name")}
+    return None
+
+
 @router.post("/price-report")
 async def price_report(req: PriceReportRequest, request: Request):
-    browser = request.app.state.browser
+    browser = request.app.state.browser  # noqa: F841 — kept for future scrapers
 
     # 並行跑所有 source + 匯率
-    yuyu_task   = yuyu_tei.scrape(browser, req.card_number)
+    yuyu_task   = _yuyu_via_search(request.app, req.card_number)
     pc_task     = pricecharting.fetch(req.card_name, req.card_number)
     rates_task  = get_rates()
 

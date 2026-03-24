@@ -56,7 +56,8 @@ async def scrape(browser, card_number: str) -> dict | None:
 
         return None
 
-    except Exception:
-        return None
+    except Exception as e:
+        # 唔 swallow exception，讓 caller 知道係咩錯
+        raise RuntimeError(f"yuyu_tei scrape failed: {type(e).__name__}: {e}") from e
     finally:
         await page.close()
