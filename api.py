@@ -65,6 +65,46 @@ def _jpy_to_hkd(jpy: int, rates: dict) -> int:
     return round(jpy * rates["JPY_HKD"])
 
 
+# ── DEBUG endpoint (臨時用，睇真實 HTML 結構) ─────────────────────────────
+
+@app.get("/debug/html")
+async def debug_html(url: str = Query(...)):
+    """fetch 一個 URL，返回 rendered HTML + 所有含價格嘅文字，幫助 debug scraper selector"""
+    page = await _browser.new_page()
+    try:
+        await page.goto(url, wait_until="networkidle", timeout=30000)
+
+        # 返回 body text（唔係完整 HTML，避免太大）
+        body_text = await page.evaluate("() => document.body.innerText")
+        inner_html = await page.evaluate("() => document.body.innerHTML")
+
+        # 搵含價格嘅行
+        price_lines = [
+            line.strip() for line in body_text.split("\n")
+            if re.search(r"[¥￥円\$]|[\d,]{3,}", line) and line.strip()
+        ][:50]
+
+        # 搵所有 class 名（幫助識別 selector）
+        all_classes = await page.evaluate("""() => {
+            const els = document.querySelectorAll('[class]');
+            const classes = new Set();
+            els.forEach(el => el.className.toString().split(' ').forEach(c => c && classes.add(c)));
+            return [...classes].filter(c => c.length > 2 && c.length < 50).slice(0, 100);
+        }""")
+
+        return {
+            "url": url,
+            "title": await page.title(),
+            "price_lines": price_lines,
+            "all_classes": all_classes,
+            "html_snippet": inner_html[:3000],  # 頭3000字
+        }
+    except Exception as e:
+        return {"error": str(e), "url": url}
+    finally:
+        await page.close()
+
+
 # ── Helper: extract JPY prices from raw page text ─────────────────────────
 
 async def _page_prices(page, min_val=200, max_val=5_000_000) -> list[int]:
