@@ -320,32 +320,21 @@ HKT = timezone(timedelta(hours=8))
 
 @app.post("/price-report")
 async def price_report(req: PriceReportRequest):
-    # 4個 scraper + 匯率並行跑
-    raw = await asyncio.gather(
-        _scrape_yuyu_tei(req.card_number),
-        _scrape_snkr_dunk(req.card_name, req.card_number),
-        _scrape_card_rush(req.card_name, req.card_number),
-        _scrape_mercari(req.card_name, req.card_number),
-        _get_rates(),
-        return_exceptions=True,
-    )
-    yuyu_r, snkr_r, rush_r, merc_r, rates = raw
-
-    if isinstance(rates, Exception):
-        rates = RATE_FALLBACK
-
+    # 順序執行，避免並行開多個 Playwright page 導致 RAM 爆
     errors = {}
 
-    def _safe(val, key):
-        if isinstance(val, Exception):
-            errors[key] = str(val)
+    async def _safe(coro, key):
+        try:
+            return await asyncio.wait_for(coro, timeout=25) or {}
+        except Exception as e:
+            errors[key] = str(e)
             return {}
-        return val or {}
 
-    yuyu = _safe(yuyu_r, "yuyu_tei")
-    snkr = _safe(snkr_r, "snkr_dunk")
-    rush = _safe(rush_r, "card_rush")
-    merc = _safe(merc_r, "mercari")
+    rates = await _get_rates()
+    yuyu  = await _safe(_scrape_yuyu_tei(req.card_number), "yuyu_tei")
+    snkr  = {}   # TODO: selector 未驗證，暫停
+    rush  = {}   # TODO: selector 未驗證，暫停
+    merc  = {}   # TODO: selector 未驗證，暫停
 
     # ── 組裝 sources ──
     def _yuyu_out(r):
