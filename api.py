@@ -645,13 +645,19 @@ async def price_report(req: PriceReportRequest):
     }
 
     # ── Summary ──
-    hkd_prices = [
-        v for k, v in [
-            ("yuyu_tei",  sources["yuyu_tei"]["price_hkd"]     if sources["yuyu_tei"]  else None),
-            ("snkr_dunk", sources["snkr_dunk"]["price_hkd"]    if sources["snkr_dunk"] else None),
-            ("mercari",   sources["mercari"]["avg_price_hkd"]  if sources["mercari"]   else None),
-        ] if v
-    ]
+    hkd_prices = []
+    if sources["yuyu_tei"]:
+        hkd_prices.append(sources["yuyu_tei"]["price_hkd"])
+    if sources["snkr_dunk"] and sources["snkr_dunk"].get("overall"):
+        hkd_prices.append(sources["snkr_dunk"]["overall"]["avg_hkd"])
+    if sources["card_rush"] and sources["card_rush"].get("overall"):
+        hkd_prices.append(sources["card_rush"]["overall"]["avg_hkd"])
+    if sources["mercari"]:
+        m = sources["mercari"]
+        if m.get("on_sale"):
+            hkd_prices.append(m["on_sale"]["avg_hkd"])
+        elif m.get("sold"):
+            hkd_prices.append(m["sold"]["avg_hkd"])
 
     summary = None
     if hkd_prices:
@@ -693,13 +699,20 @@ def _fmt_tg(card_label, ts, sources, summary, req) -> str:
         jp.append(f"遊々亭：¥{s['price_jpy']:,} (HK${s['price_hkd']:,})")
     if sources["snkr_dunk"]:
         s = sources["snkr_dunk"]
-        jp.append(f"SNKR Dunk：¥{s['price_jpy']:,} (HK${s['price_hkd']:,})")
+        ov = s.get("overall", {})
+        jp.append(f"SNKR Dunk：¥{ov.get('min_jpy',0):,}～¥{ov.get('max_jpy',0):,} 平均¥{ov.get('avg_jpy',0):,} (HK${ov.get('min_hkd',0):,}～{ov.get('max_hkd',0):,}) [{s.get('listing_count','?')}個]")
     if sources["card_rush"]:
         s = sources["card_rush"]
-        jp.append(f"Card Rush 收購：¥{s['buy_price_jpy']:,} (HK${s['buy_price_hkd']:,})")
+        ov = s.get("overall", {})
+        jp.append(f"Card Rush：¥{ov.get('min_jpy',0):,}～¥{ov.get('max_jpy',0):,} 平均¥{ov.get('avg_jpy',0):,} (HK${ov.get('min_hkd',0):,}～{ov.get('max_hkd',0):,}) [{s.get('listing_count','?')}個]")
     if sources["mercari"]:
         s = sources["mercari"]
-        jp.append(f"Mercari 均價：¥{s['avg_price_jpy']:,} (HK${s['avg_price_hkd']:,}) [{s.get('listing_count','?')}個]")
+        if s.get("on_sale"):
+            ov = s["on_sale"]
+            jp.append(f"Mercari TW 在售：NT${ov['min_twd']:,}～NT${ov['max_twd']:,} 平均NT${ov['avg_twd']:,} (HK${ov['min_hkd']:,}～{ov['max_hkd']:,}) [{ov['count']}個]")
+        if s.get("sold"):
+            ov = s["sold"]
+            jp.append(f"Mercari TW 已售：NT${ov['min_twd']:,}～NT${ov['max_twd']:,} 平均NT${ov['avg_twd']:,} (HK${ov['min_hkd']:,}～{ov['max_hkd']:,}) [{ov['count']}個]")
 
     if jp:
         lines += ["💴 *日本市場*"] + jp + [""]
