@@ -19,17 +19,29 @@ from pydantic import BaseModel
 
 _pw: Playwright = None
 _browser = None
+_stealth_context = None  # browser context with anti-bot headers (for Cloudflare sites)
+
+_STEALTH_UA = (
+    "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+    "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36"
+)
 
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    global _pw, _browser
+    global _pw, _browser, _stealth_context
     _pw = await async_playwright().start()
     _browser = await _pw.chromium.launch(
         headless=True,
-        args=["--no-sandbox", "--disable-dev-shm-usage"],
+        args=["--no-sandbox", "--disable-dev-shm-usage", "--disable-blink-features=AutomationControlled"],
+    )
+    _stealth_context = await _browser.new_context(
+        user_agent=_STEALTH_UA,
+        viewport={"width": 1280, "height": 800},
+        locale="ja-JP",
     )
     yield
+    await _stealth_context.close()
     await _browser.close()
     await _pw.stop()
 
@@ -240,31 +252,97 @@ async def _scrape_snkr_dunk(card_number: str) -> dict:
 
 # ── Scraper 3: Card Rush ──────────────────────────────────────────────────
 
-async def _scrape_card_rush(card_name: str, card_number: str) -> dict:
-    page = await _browser.new_page()
+_CR_STEALTH_SCRIPT = "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+
+
+def _parse_cr_grade(name: str) -> str:
+    """〔PSA10鑑定済〕→ PSA10、〔状態B〕→ 状態B、grade 唔明 → raw"""
+    m = re.search(r"〔([^〕]+)〕", name)
+    if not m:
+        return "raw"
+    tag = m.group(1)
+    g = re.search(r"(PSA\d+|BGS[\d.]+|ARS\d+|PCG\d+|CGC\d+)", tag)
+    if g:
+        return g.group(1)
+    if "状態" in tag:
+        return "状態" + tag.replace("状態", "").replace("※", "").strip()
+    return tag.replace("鑑定済", "").replace("※状態難/", "").strip() or "raw"
+
+
+async def _scrape_card_rush(card_number: str) -> dict:
+    """
+    Playwright + Cloudflare stealth。
+    返回所有 listing，按 grade 分組 min/max/avg，並標記在庫狀態。
+    """
+    page = await _stealth_context.new_page()
     try:
-        q = quote(f"{card_name} {card_number}".strip())
-        await page.goto(f"https://www.cardrush-pokemon.jp/product-list?search_word={q}")
-        await page.wait_for_load_state("networkidle", timeout=25000)
+        await page.add_init_script(_CR_STEALTH_SCRIPT)
+        q = quote(card_number)
+        await page.goto(
+            f"https://www.cardrush-pokemon.jp/product-list?keyword={q}&Submit=%E6%A4%9C%E7%B4%A2",
+            wait_until="domcontentloaded",
+            timeout=35000,
+        )
+        await page.wait_for_timeout(5000)
 
-        selectors = [
-            ".buy-price",
-            "[class*='buy']",
-            "[class*='price']",
-            ".product-price",
-        ]
-        for sel in selectors:
-            el = await page.query_selector(sel)
-            if el:
-                digits = re.sub(r"[^\d]", "", (await el.inner_text()).strip())
-                if digits and int(digits) > 200:
-                    return {"buy_price_jpy": int(digits)}
+        raw = await page.evaluate("""() => {
+            const results = [];
+            document.querySelectorAll(".selling_price").forEach(priceEl => {
+                const li      = priceEl.closest("li") || priceEl.parentElement;
+                const nameEl  = li.querySelector(".goods_name");
+                const stockEl = li.querySelector(".stock");
+                const figEl   = priceEl.querySelector(".figure");
+                results.push({
+                    name:  nameEl ? nameEl.innerText.trim() : "",
+                    price: figEl  ? figEl.innerText.trim()  : "",
+                    stock: stockEl ? stockEl.innerText.trim() : "",
+                });
+            });
+            return results;
+        }""")
 
-        prices = await _page_prices(page)
-        if prices:
-            return {"buy_price_jpy": prices[0]}
+        listings = []
+        for item in raw:
+            digits = re.sub(r"[^\d]", "", item["price"])
+            if not digits:
+                continue
+            listings.append({
+                "price_jpy": int(digits),
+                "grade":     _parse_cr_grade(item["name"]),
+                "in_stock":  item["stock"] != "×" and "在庫" in item["stock"],
+                "name":      item["name"],
+            })
 
-        return {}
+        if not listings:
+            return {}
+
+        # 分組統計
+        by_grade: dict[str, list[int]] = {}
+        for l in listings:
+            by_grade.setdefault(l["grade"], []).append(l["price_jpy"])
+
+        grade_stats = {
+            grade: {
+                "count":   len(prices),
+                "min_jpy": min(prices),
+                "max_jpy": max(prices),
+                "avg_jpy": round(sum(prices) / len(prices)),
+            }
+            for grade, prices in by_grade.items()
+        }
+
+        all_prices = [l["price_jpy"] for l in listings]
+        return {
+            "listing_count": len(listings),
+            "by_grade":      grade_stats,
+            "overall": {
+                "min_jpy": min(all_prices),
+                "max_jpy": max(all_prices),
+                "avg_jpy": round(sum(all_prices) / len(all_prices)),
+            },
+            "listings": listings,
+        }
+
     except Exception as e:
         raise RuntimeError(f"card_rush failed: {type(e).__name__}: {e}")
     finally:
@@ -347,6 +425,29 @@ async def search(
 
 # ── GET /snkr-dunk ────────────────────────────────────────────────────────
 
+@app.get("/card-rush")
+async def card_rush_search(
+    cardNumber: str = Query(..., example="288/SM-P"),
+):
+    """Card Rush 獨立查詢，返回各 grade min/max/avg（含 HKD 換算）及在庫狀態。"""
+    try:
+        rates, result = await asyncio.gather(_get_rates(), _scrape_card_rush(cardNumber))
+        if not result:
+            return {"card_number": cardNumber, "message": "no results found"}
+        for stats in result.get("by_grade", {}).values():
+            stats["min_hkd"] = _jpy_to_hkd(stats["min_jpy"], rates)
+            stats["max_hkd"] = _jpy_to_hkd(stats["max_jpy"], rates)
+            stats["avg_hkd"] = _jpy_to_hkd(stats["avg_jpy"], rates)
+        ov = result["overall"]
+        ov["min_hkd"] = _jpy_to_hkd(ov["min_jpy"], rates)
+        ov["max_hkd"] = _jpy_to_hkd(ov["max_jpy"], rates)
+        ov["avg_hkd"] = _jpy_to_hkd(ov["avg_jpy"], rates)
+        result["exchange_rates"] = rates
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 @app.get("/snkr-dunk")
 async def snkr_dunk_search(
     cardNumber: str = Query(..., example="288/SM-P"),
@@ -399,7 +500,7 @@ async def price_report(req: PriceReportRequest):
     rates = await _get_rates()
     yuyu  = await _safe(_scrape_yuyu_tei(req.card_number), "yuyu_tei")
     snkr  = await _safe(_scrape_snkr_dunk(req.card_number), "snkr_dunk")
-    rush  = {}   # TODO: selector 未驗證，暫停
+    rush  = await _safe(_scrape_card_rush(req.card_number), "card_rush")
     merc  = {}   # TODO: selector 未驗證，暫停
 
     # ── 組裝 sources ──
@@ -432,8 +533,27 @@ async def price_report(req: PriceReportRequest):
         }
 
     def _rush_out(r):
-        if not r.get("buy_price_jpy"): return None
-        return {"buy_price_jpy": r["buy_price_jpy"], "buy_price_hkd": _jpy_to_hkd(r["buy_price_jpy"], rates), "currency": "JPY"}
+        if not r.get("overall"): return None
+        by_grade_hkd = {}
+        for grade, stats in r.get("by_grade", {}).items():
+            by_grade_hkd[grade] = {
+                **stats,
+                "min_hkd": _jpy_to_hkd(stats["min_jpy"], rates),
+                "max_hkd": _jpy_to_hkd(stats["max_jpy"], rates),
+                "avg_hkd": _jpy_to_hkd(stats["avg_jpy"], rates),
+            }
+        ov = r["overall"]
+        return {
+            "listing_count": r["listing_count"],
+            "by_grade":      by_grade_hkd,
+            "overall": {
+                **ov,
+                "min_hkd": _jpy_to_hkd(ov["min_jpy"], rates),
+                "max_hkd": _jpy_to_hkd(ov["max_jpy"], rates),
+                "avg_hkd": _jpy_to_hkd(ov["avg_jpy"], rates),
+            },
+            "currency": "JPY",
+        }
 
     def _merc_out(r):
         if not r.get("avg_price_jpy"): return None
