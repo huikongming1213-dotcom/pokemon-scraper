@@ -4,6 +4,7 @@ Pokemon Card Price Scraper
 """
 from contextlib import asynccontextmanager
 import asyncio
+import json
 import re
 import time
 from datetime import datetime, timezone, timedelta
@@ -349,37 +350,99 @@ async def _scrape_card_rush(card_number: str) -> dict:
         await page.close()
 
 
-# ── Scraper 4: Mercari Japan ──────────────────────────────────────────────
+# ── Scraper 4: Mercari TW ────────────────────────────────────────────────
 
-async def _scrape_mercari(card_name: str, card_number: str) -> dict:
-    page = await _browser.new_page()
+def _mercari_stats(prices: list[int]) -> dict:
+    return {
+        "count":   len(prices),
+        "min_twd": min(prices),
+        "max_twd": max(prices),
+        "avg_twd": round(sum(prices) / len(prices)),
+    }
+
+
+async def _get_twd_hkd_rate() -> float:
+    """TWD → HKD 匯率（1 TWD = ? HKD），1hr cache"""
+    cache_key = "TWD_HKD"
+    if _rate_cache.get(cache_key + "_ts") and time.time() - _rate_cache[cache_key + "_ts"] < 3600:
+        return _rate_cache[cache_key]
     try:
-        q = quote(f"{card_name} {card_number}".strip())
-        await page.goto(f"https://jp.mercari.com/search?keyword={q}&status=on_sale")
-        await page.wait_for_load_state("networkidle", timeout=30000)
+        async with httpx.AsyncClient(timeout=8) as client:
+            r = await client.get("https://api.exchangerate-api.com/v4/latest/TWD")
+            r.raise_for_status()
+            rate = r.json()["rates"].get("HKD", 0.24)
+            _rate_cache[cache_key] = rate
+            _rate_cache[cache_key + "_ts"] = time.time()
+            return rate
+    except Exception:
+        return 0.24  # fallback
 
-        # Mercari item price selectors
-        price_els = await page.query_selector_all(
-            "[data-testid='price'], [class*='merPrice'], [class*='item-price'], [class*='ItemPrice']"
+
+async def _scrape_mercari_tw(card_number: str) -> dict:
+    """
+    Playwright + stealth context，爬 Mercari TW。
+    從 script tag 提取 initialItems JSON。
+    返回在售 / 已售各自 min/max/avg (NTD + HKD)。
+    """
+    page = await _stealth_context.new_page()
+    try:
+        await page.add_init_script(_CR_STEALTH_SCRIPT)
+        q = quote(card_number)
+        await page.goto(
+            f"https://tw.mercari.com/zh-hant/search?keyword={q}",
+            wait_until="domcontentloaded",
+            timeout=35000,
         )
-        prices = []
-        for el in price_els[:15]:
-            digits = re.sub(r"[^\d]", "", (await el.inner_text()).strip())
-            if digits and 200 <= int(digits) <= 5_000_000:
-                prices.append(int(digits))
+        await page.wait_for_timeout(4000)
 
-        if not prices:
-            prices = await _page_prices(page)
+        # 提取 initialItems — Python 端 parse，避免 JS regex escape 問題
+        html = await page.evaluate("() => document.body.innerHTML")
+        scripts = re.findall(r"<script[^>]*>(.*?)</script>", html, re.DOTALL)
+        target = next((s for s in scripts if "initialItems" in s), None)
+        if not target:
+            return {}
 
-        if prices:
+        unescaped = target.replace('\\\\"', '"')
+        m = re.search(r'"initialItems":\[(.+?)\],"', unescaped)
+        if not m:
+            return {}
+
+        raw = json.loads("[" + m.group(1) + "]")
+
+        on_sale, sold = [], []
+        for item in raw:
+            price_str = item.get("price", {}).get("formattedAmount", "")
+            digits = re.sub(r"[^\d]", "", price_str)
+            if not digits:
+                continue
+            price = int(digits)
+            if item.get("availability") == 1:
+                on_sale.append(price)
+            else:
+                sold.append(price)
+
+        if not on_sale and not sold:
+            return {}
+
+        twd_rate = await _get_twd_hkd_rate()
+
+        def _with_hkd(stats: dict) -> dict:
             return {
-                "avg_price_jpy":     round(sum(prices) / len(prices)),
-                "min_price_jpy":     min(prices),
-                "listing_count":     len(prices),
+                **stats,
+                "min_hkd": round(stats["min_twd"] * twd_rate),
+                "max_hkd": round(stats["max_twd"] * twd_rate),
+                "avg_hkd": round(stats["avg_twd"] * twd_rate),
             }
-        return {}
+
+        return {
+            "currency":    "TWD",
+            "twd_hkd_rate": twd_rate,
+            "on_sale":     _with_hkd(_mercari_stats(on_sale))  if on_sale else None,
+            "sold":        _with_hkd(_mercari_stats(sold))     if sold    else None,
+        }
+
     except Exception as e:
-        raise RuntimeError(f"mercari failed: {type(e).__name__}: {e}")
+        raise RuntimeError(f"mercari_tw failed: {type(e).__name__}: {e}")
     finally:
         await page.close()
 
@@ -424,6 +487,20 @@ async def search(
 
 
 # ── GET /snkr-dunk ────────────────────────────────────────────────────────
+
+@app.get("/mercari")
+async def mercari_search(
+    cardNumber: str = Query(..., example="288/SM-P"),
+):
+    """Mercari TW 獨立查詢，返回在售/已售 min/max/avg（TWD + HKD）。"""
+    try:
+        result = await _scrape_mercari_tw(cardNumber)
+        if not result:
+            return {"card_number": cardNumber, "message": "no results found"}
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
 
 @app.get("/card-rush")
 async def card_rush_search(
@@ -501,7 +578,7 @@ async def price_report(req: PriceReportRequest):
     yuyu  = await _safe(_scrape_yuyu_tei(req.card_number), "yuyu_tei")
     snkr  = await _safe(_scrape_snkr_dunk(req.card_number), "snkr_dunk")
     rush  = await _safe(_scrape_card_rush(req.card_number), "card_rush")
-    merc  = {}   # TODO: selector 未驗證，暫停
+    merc  = await _safe(_scrape_mercari_tw(req.card_number), "mercari_tw")
 
     # ── 組裝 sources ──
     def _yuyu_out(r):
@@ -556,15 +633,8 @@ async def price_report(req: PriceReportRequest):
         }
 
     def _merc_out(r):
-        if not r.get("avg_price_jpy"): return None
-        return {
-            "avg_price_jpy":  r["avg_price_jpy"],
-            "avg_price_hkd":  _jpy_to_hkd(r["avg_price_jpy"], rates),
-            "min_price_jpy":  r.get("min_price_jpy"),
-            "min_price_hkd":  _jpy_to_hkd(r["min_price_jpy"], rates) if r.get("min_price_jpy") else None,
-            "listing_count":  r.get("listing_count"),
-            "currency":       "JPY",
-        }
+        if not r.get("on_sale") and not r.get("sold"): return None
+        return r  # already has HKD inside
 
     sources = {
         "yuyu_tei":    _yuyu_out(yuyu),
