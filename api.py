@@ -161,40 +161,81 @@ async def _scrape_yuyu_tei(card_number: str) -> dict:
         await page.close()
 
 
-# ── Scraper 2: SNKR Dunk ──────────────────────────────────────────────────
+# ── Scraper 2: SNKR Dunk (pure httpx, no Playwright) ──────────────────────
 
-async def _scrape_snkr_dunk(card_name: str, card_number: str) -> dict:
-    page = await _browser.new_page()
-    try:
-        q = quote(f"{card_name} {card_number}".strip())
-        await page.goto(f"https://snkrdunk.com/en/pokemon-cards?q={q}")
-        await page.wait_for_load_state("networkidle", timeout=25000)
+_SNKR_HEADERS = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
+    "Accept":     "application/json",
+    "Referer":    "https://snkrdunk.com/",
+}
 
-        # 試 specific selectors
-        selectors = [
-            "[class*='CardPrice']",
-            "[class*='card-price']",
-            "[class*='product-price']",
-            "[class*='item-price']",
-            ".price",
-        ]
-        for sel in selectors:
-            el = await page.query_selector(sel)
-            if el:
-                digits = re.sub(r"[^\d]", "", (await el.inner_text()).strip())
-                if digits and int(digits) > 200:
-                    return {"price_jpy": int(digits)}
 
-        # Fallback: extract from page text
-        prices = await _page_prices(page)
-        if prices:
-            return {"price_jpy": prices[0]}
+def _grade_stats(listings: list[dict], grade_key: str) -> dict | None:
+    """計算某 grade 的 min/max/avg/count"""
+    items = [l for l in listings if l["grade"] == grade_key]
+    if not items:
+        return None
+    prices = [l["price_jpy"] for l in items]
+    return {
+        "count":       len(items),
+        "min_jpy":     min(prices),
+        "max_jpy":     max(prices),
+        "avg_jpy":     round(sum(prices) / len(prices)),
+    }
 
+
+async def _scrape_snkr_dunk(card_number: str) -> dict:
+    """
+    純 httpx，唔使 Playwright。
+    返回所有 listing，並按 PSA8/PSA9/PSA10/raw 分組統計 min/max/avg。
+    """
+    q = quote(card_number)
+    url = (
+        f"https://snkrdunk.com/v3/search"
+        f"?func=all&refId=search&cardVersion=2&sortKey=default"
+        f"&isDiscounted=false&isFirstHand=false&isUnderRetail=false"
+        f"&stock=any&keyword={q}"
+    )
+    async with httpx.AsyncClient(timeout=15, headers=_SNKR_HEADERS) as client:
+        r = await client.get(url)
+        r.raise_for_status()
+        data = r.json()
+
+    products = data.get("search", {}).get("products", [])
+    if not products:
         return {}
-    except Exception as e:
-        raise RuntimeError(f"snkr_dunk failed: {type(e).__name__}: {e}")
-    finally:
-        await page.close()
+
+    listings = [
+        {
+            "price_jpy": p["salePrice"],
+            "grade":     p.get("condition") or "raw",
+            "name":      p.get("title", ""),
+        }
+        for p in products
+        if p.get("salePrice", 0) > 0
+    ]
+
+    if not listings:
+        return {}
+
+    # 分組統計
+    by_grade = {}
+    for grade_key in ("PSA10", "PSA9", "PSA8", "PSA8以下", "raw"):
+        stats = _grade_stats(listings, grade_key)
+        if stats:
+            by_grade[grade_key] = stats
+
+    all_prices = [l["price_jpy"] for l in listings]
+    return {
+        "listing_count": len(listings),
+        "by_grade":      by_grade,
+        "overall": {
+            "min_jpy": min(all_prices),
+            "max_jpy": max(all_prices),
+            "avg_jpy": round(sum(all_prices) / len(all_prices)),
+        },
+        "listings": listings,
+    }
 
 
 # ── Scraper 3: Card Rush ──────────────────────────────────────────────────
@@ -304,6 +345,31 @@ async def search(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ── GET /snkr-dunk ────────────────────────────────────────────────────────
+
+@app.get("/snkr-dunk")
+async def snkr_dunk_search(
+    cardNumber: str = Query(..., example="288/SM-P"),
+):
+    """SNKR Dunk 獨立查詢，返回 PSA8/PSA9/PSA10/raw 分組 min/max/avg（含 HKD 換算）。"""
+    try:
+        rates, result = await asyncio.gather(_get_rates(), _scrape_snkr_dunk(cardNumber))
+        if not result:
+            return {"card_number": cardNumber, "message": "no results found"}
+        for grade, stats in result.get("by_grade", {}).items():
+            stats["min_hkd"] = _jpy_to_hkd(stats["min_jpy"], rates)
+            stats["max_hkd"] = _jpy_to_hkd(stats["max_jpy"], rates)
+            stats["avg_hkd"] = _jpy_to_hkd(stats["avg_jpy"], rates)
+        ov = result["overall"]
+        ov["min_hkd"] = _jpy_to_hkd(ov["min_jpy"], rates)
+        ov["max_hkd"] = _jpy_to_hkd(ov["max_jpy"], rates)
+        ov["avg_hkd"] = _jpy_to_hkd(ov["avg_jpy"], rates)
+        result["exchange_rates"] = rates
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ── POST /price-report ────────────────────────────────────────────────────
 
 class PriceReportRequest(BaseModel):
@@ -332,7 +398,7 @@ async def price_report(req: PriceReportRequest):
 
     rates = await _get_rates()
     yuyu  = await _safe(_scrape_yuyu_tei(req.card_number), "yuyu_tei")
-    snkr  = {}   # TODO: selector 未驗證，暫停
+    snkr  = await _safe(_scrape_snkr_dunk(req.card_number), "snkr_dunk")
     rush  = {}   # TODO: selector 未驗證，暫停
     merc  = {}   # TODO: selector 未驗證，暫停
 
@@ -342,8 +408,28 @@ async def price_report(req: PriceReportRequest):
         return {"price_jpy": r["price_jpy"], "price_hkd": _jpy_to_hkd(r["price_jpy"], rates), "name": r.get("name"), "currency": "JPY"}
 
     def _snkr_out(r):
-        if not r.get("price_jpy"): return None
-        return {"price_jpy": r["price_jpy"], "price_hkd": _jpy_to_hkd(r["price_jpy"], rates), "currency": "JPY"}
+        if not r.get("overall"): return None
+        # 加 HKD 換算到每個 grade
+        by_grade_hkd = {}
+        for grade, stats in r.get("by_grade", {}).items():
+            by_grade_hkd[grade] = {
+                **stats,
+                "min_hkd": _jpy_to_hkd(stats["min_jpy"], rates),
+                "max_hkd": _jpy_to_hkd(stats["max_jpy"], rates),
+                "avg_hkd": _jpy_to_hkd(stats["avg_jpy"], rates),
+            }
+        ov = r["overall"]
+        return {
+            "listing_count": r["listing_count"],
+            "by_grade":      by_grade_hkd,
+            "overall": {
+                **ov,
+                "min_hkd": _jpy_to_hkd(ov["min_jpy"], rates),
+                "max_hkd": _jpy_to_hkd(ov["max_jpy"], rates),
+                "avg_hkd": _jpy_to_hkd(ov["avg_jpy"], rates),
+            },
+            "currency": "JPY",
+        }
 
     def _rush_out(r):
         if not r.get("buy_price_jpy"): return None
