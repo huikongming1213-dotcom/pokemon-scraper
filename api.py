@@ -436,7 +436,11 @@ async def _scrape_mercari_tw(card_number: str) -> dict:
             wait_until="domcontentloaded",
             timeout=35000,
         )
-        await page.wait_for_timeout(5000)
+        # 等 React hydration 完成（items 渲染出嚟），networkidle 係最可靠嘅信號
+        try:
+            await page.wait_for_load_state("networkidle", timeout=20000)
+        except Exception:
+            await page.wait_for_timeout(5000)  # fallback: 等多 5s
 
         # body.innerText: Mercari 將 NT$ 同數字分成兩行（獨立 DOM 元素）
         # 格式: "...NT$\n6,785\n..." 或 "...已售出\nNT$\n6,785\n..."
