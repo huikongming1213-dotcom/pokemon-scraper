@@ -438,28 +438,29 @@ async def _scrape_mercari_tw(card_number: str) -> dict:
         )
         await page.wait_for_timeout(5000)
 
-        # 直接從 DOM 提取：搵所有 item 連結，逐個提取價格同售出狀態
+        # body.innerText: Mercari 將 NT$ 同數字分成兩行（獨立 DOM 元素）
+        # 格式: "...NT$\n6,785\n..." 或 "...已售出\nNT$\n6,785\n..."
         items_data = await page.evaluate(r"""() => {
+            const text = document.body.innerText || '';
+            const lines = text.split('\n').map(l => l.trim()).filter(l => l);
             const results = [];
-            document.querySelectorAll('a[href*="/item/"]').forEach(el => {
-                const text = el.innerText || '';
-                // NT$ 同數字可能係兩個獨立 DOM 元素，innerText 會顯示為分行
-                const priceMatch = text.match(/NT\$[\s\u00a0\n]*([\d,]+)/);
-                if (!priceMatch) return;
-                const price = parseInt(priceMatch[1].replace(/,/g, ''));
-                if (price < 50 || price > 50000000) return;
+            for (let i = 0; i < lines.length; i++) {
+                // 偵測 NT$ 行（有時 NT$ 同數字在同一行，有時分開）
+                let price = 0;
+                if (lines[i] === 'NT$' && i + 1 < lines.length) {
+                    const num = lines[i + 1].replace(/,/g, '');
+                    if (/^\d+$/.test(num)) { price = parseInt(num); i++; }
+                } else {
+                    const m = lines[i].match(/^NT\$\s*([\d,]+)$/);
+                    if (m) price = parseInt(m[1].replace(/,/g, ''));
+                }
+                if (price < 50 || price > 50000000) continue;
 
-                // 判斷是否已售：檢查文字、class 或 aria-label
-                const isSold = (
-                    text.includes('已售出') ||
-                    text.includes('SOLD') ||
-                    text.includes('Sold out') ||
-                    !!el.querySelector('[class*="sold" i],[class*="SoldOut" i],[class*="sold-out" i]') ||
-                    (el.getAttribute('aria-label') || '').includes('已售出')
-                );
-
+                // 往前 8 行內有無「已售出」
+                const ctx = lines.slice(Math.max(0, i - 8), i + 2).join(' ');
+                const isSold = ctx.includes('已售出') || ctx.includes('SOLD') || ctx.includes('Sold out');
                 results.push({ price, is_sold: isSold });
-            });
+            }
             return results;
         }""")
 
