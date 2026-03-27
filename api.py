@@ -253,7 +253,20 @@ async def _scrape_snkr_dunk(card_number: str) -> dict:
 
 # ── Scraper 3: Card Rush ──────────────────────────────────────────────────
 
-_CR_STEALTH_SCRIPT = "Object.defineProperty(navigator, 'webdriver', {get: () => undefined})"
+_CR_STEALTH_SCRIPT = """
+Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
+Object.defineProperty(navigator, 'plugins', {get: () => {
+    const arr = [1,2,3,4,5];
+    arr.item = (i) => arr[i]; arr.namedItem = () => null; arr.refresh = () => {};
+    return arr;
+}});
+Object.defineProperty(navigator, 'languages', {get: () => ['ja-JP','ja','en-US','en']});
+Object.defineProperty(navigator, 'hardwareConcurrency', {get: () => 4});
+Object.defineProperty(navigator, 'deviceMemory', {get: () => 8});
+window.chrome = {app:{isInstalled:false},runtime:{},loadTimes:()=>({}),csi:()=>({})};
+const orig = window.Notification;
+if (orig) Object.defineProperty(window, 'Notification', {get: () => orig});
+"""
 
 
 def _parse_cr_grade(name: str) -> str:
@@ -284,10 +297,23 @@ async def _scrape_card_rush(card_number: str) -> dict:
             wait_until="domcontentloaded",
             timeout=35000,
         )
-        await page.wait_for_timeout(5000)
+
+        # 等待真實頁面載入（Cloudflare challenge 需要時間 solve）
+        # 等到 .selling_price 出現，或最多等 20 秒
+        try:
+            await page.wait_for_selector(".selling_price, .goods_name", timeout=20000)
+        except Exception:
+            pass  # timeout — 繼續，讓後面 evaluate 決定有無結果
+
+        # 診斷：記錄頁面標題（方便 debug Cloudflare 問題）
+        title = await page.title()
+        if "moment" in title.lower() or "cloudflare" in title.lower() or not title:
+            # 仍在 challenge page，等多 10 秒再試
+            await page.wait_for_timeout(10000)
 
         raw = await page.evaluate("""() => {
             const results = [];
+            // 主 selector
             document.querySelectorAll(".selling_price").forEach(priceEl => {
                 const li      = priceEl.closest("li") || priceEl.parentElement;
                 const nameEl  = li.querySelector(".goods_name");
@@ -297,8 +323,25 @@ async def _scrape_card_rush(card_number: str) -> dict:
                     name:  nameEl ? nameEl.innerText.trim() : "",
                     price: figEl  ? figEl.innerText.trim()  : "",
                     stock: stockEl ? stockEl.innerText.trim() : "",
+                    _src: "selling_price",
                 });
             });
+            // Fallback：搵任何含日圓價格嘅元素
+            if (results.length === 0) {
+                document.querySelectorAll("[class*='price'],[class*='Price']").forEach(el => {
+                    const t = el.innerText.trim();
+                    if (/[¥￥][\d,]{3,}|[\d,]{3,}円/.test(t)) {
+                        const li = el.closest("li") || el.parentElement;
+                        const nameEl = li ? li.querySelector("[class*='name'],[class*='Name']") : null;
+                        results.push({
+                            name:  nameEl ? nameEl.innerText.trim() : "",
+                            price: t,
+                            stock: "",
+                            _src: "fallback",
+                        });
+                    }
+                });
+            }
             return results;
         }""")
 
@@ -381,7 +424,7 @@ async def _get_twd_hkd_rate() -> float:
 async def _scrape_mercari_tw(card_number: str) -> dict:
     """
     Playwright + stealth context，爬 Mercari TW。
-    從 script tag 提取 initialItems JSON。
+    用 DOM 直接提取價格（Mercari 已改 Next.js App Router，無 initialItems script tag）。
     返回在售 / 已售各自 min/max/avg (NTD + HKD)。
     """
     page = await _stealth_context.new_page()
@@ -393,33 +436,35 @@ async def _scrape_mercari_tw(card_number: str) -> dict:
             wait_until="domcontentloaded",
             timeout=35000,
         )
-        await page.wait_for_timeout(4000)
+        await page.wait_for_timeout(5000)
 
-        # 提取 initialItems — Python 端 parse，避免 JS regex escape 問題
-        html = await page.evaluate("() => document.body.innerHTML")
-        scripts = re.findall(r"<script[^>]*>(.*?)</script>", html, re.DOTALL)
-        target = next((s for s in scripts if "initialItems" in s), None)
-        if not target:
-            return {}
+        # 直接從 DOM 提取：搵所有 item 連結，逐個提取價格同售出狀態
+        items_data = await page.evaluate(r"""() => {
+            const results = [];
+            document.querySelectorAll('a[href*="/item/"]').forEach(el => {
+                const text = el.innerText || '';
+                // NT$ 同數字可能係兩個獨立 DOM 元素，innerText 會顯示為分行
+                const priceMatch = text.match(/NT\$[\s\u00a0\n]*([\d,]+)/);
+                if (!priceMatch) return;
+                const price = parseInt(priceMatch[1].replace(/,/g, ''));
+                if (price < 50 || price > 50000000) return;
 
-        unescaped = target.replace('\\\\"', '"')
-        m = re.search(r'"initialItems":\[(.+?)\],"', unescaped)
-        if not m:
-            return {}
+                // 判斷是否已售：檢查文字、class 或 aria-label
+                const isSold = (
+                    text.includes('已售出') ||
+                    text.includes('SOLD') ||
+                    text.includes('Sold out') ||
+                    !!el.querySelector('[class*="sold" i],[class*="SoldOut" i],[class*="sold-out" i]') ||
+                    (el.getAttribute('aria-label') || '').includes('已售出')
+                );
 
-        raw = json.loads("[" + m.group(1) + "]")
+                results.push({ price, is_sold: isSold });
+            });
+            return results;
+        }""")
 
-        on_sale, sold = [], []
-        for item in raw:
-            price_str = item.get("price", {}).get("formattedAmount", "")
-            digits = re.sub(r"[^\d]", "", price_str)
-            if not digits:
-                continue
-            price = int(digits)
-            if item.get("availability") == 1:
-                on_sale.append(price)
-            else:
-                sold.append(price)
+        on_sale = [d["price"] for d in items_data if not d["is_sold"]]
+        sold    = [d["price"] for d in items_data if     d["is_sold"]]
 
         if not on_sale and not sold:
             return {}
@@ -686,50 +731,66 @@ async def price_report(req: PriceReportRequest):
 
 
 def _fmt_tg(card_label, ts, sources, summary, req) -> str:
+    import unicodedata as _ud
+
+    def _dw(s: str) -> int:
+        return sum(2 if _ud.east_asian_width(c) in ('W', 'F') else 1 for c in s)
+
+    def _rpad(s: str, w: int) -> str:
+        return s + ' ' * max(0, w - _dw(s))
+
     lines = [
-        "📊 *價格報告*",
-        f"卡名：{card_label}",
-        f"查詢時間：{ts.strftime('%Y-%m-%d %H:%M')} (HKT)",
-        "",
+        "🔔 <b>報價審批</b>",
+        f"卡名：<b>{card_label}</b>",
+        f"時間：{ts.strftime('%m-%d %H:%M')} HKT",
     ]
 
-    jp = []
-    if sources["yuyu_tei"]:
-        s = sources["yuyu_tei"]
-        jp.append(f"遊々亭：¥{s['price_jpy']:,} (HK${s['price_hkd']:,})")
-    if sources["snkr_dunk"]:
-        s = sources["snkr_dunk"]
-        ov = s.get("overall", {})
-        jp.append(f"SNKR Dunk：¥{ov.get('min_jpy',0):,}～¥{ov.get('max_jpy',0):,} 平均¥{ov.get('avg_jpy',0):,} (HK${ov.get('min_hkd',0):,}～{ov.get('max_hkd',0):,}) [{s.get('listing_count','?')}個]")
-    if sources["card_rush"]:
-        s = sources["card_rush"]
-        ov = s.get("overall", {})
-        jp.append(f"Card Rush：¥{ov.get('min_jpy',0):,}～¥{ov.get('max_jpy',0):,} 平均¥{ov.get('avg_jpy',0):,} (HK${ov.get('min_hkd',0):,}～{ov.get('max_hkd',0):,}) [{s.get('listing_count','?')}個]")
-    if sources["mercari"]:
-        s = sources["mercari"]
-        if s.get("on_sale"):
-            ov = s["on_sale"]
-            jp.append(f"Mercari TW 在售：NT${ov['min_twd']:,}～NT${ov['max_twd']:,} 平均NT${ov['avg_twd']:,} (HK${ov['min_hkd']:,}～{ov['max_hkd']:,}) [{ov['count']}個]")
-        if s.get("sold"):
-            ov = s["sold"]
-            jp.append(f"Mercari TW 已售：NT${ov['min_twd']:,}～NT${ov['max_twd']:,} 平均NT${ov['avg_twd']:,} (HK${ov['min_hkd']:,}～{ov['max_hkd']:,}) [{ov['count']}個]")
+    # 建立價格表（HKD）
+    rows: list[tuple[str, int, int, int]] = []  # (來源, 低, 高, 均)
 
-    if jp:
-        lines += ["💴 *日本市場*"] + jp + [""]
+    if sources.get("yuyu_tei"):
+        h = sources["yuyu_tei"]["price_hkd"]
+        rows.append(("遊々亭", h, h, h))
+
+    if sources.get("snkr_dunk"):
+        ov = sources["snkr_dunk"].get("overall", {})
+        if ov:
+            rows.append(("SNKR Dunk", ov["min_hkd"], ov["max_hkd"], ov["avg_hkd"]))
+
+    if sources.get("card_rush"):
+        ov = sources["card_rush"].get("overall", {})
+        if ov:
+            rows.append(("Card Rush", ov["min_hkd"], ov["max_hkd"], ov["avg_hkd"]))
+
+    if sources.get("mercari"):
+        m = sources["mercari"]
+        if m.get("on_sale"):
+            ov = m["on_sale"]
+            rows.append(("Mercari在售", ov["min_hkd"], ov["max_hkd"], ov["avg_hkd"]))
+        if m.get("sold"):
+            ov = m["sold"]
+            rows.append(("Mercari已售", ov["min_hkd"], ov["max_hkd"], ov["avg_hkd"]))
+
+    if rows:
+        C = 12  # 來源欄顯示寬度
+        hdr = _rpad("來源", C) + _rpad("低", 6) + _rpad("高", 6) + "均(HKD)"
+        sep = "─" * (C + 6 + 6 + 7)
+        tbl = [hdr, sep] + [
+            _rpad(n, C) + _rpad(str(lo), 6) + _rpad(str(hi), 6) + str(avg)
+            for n, lo, hi, avg in rows
+        ]
+        lines += ["", "<pre>" + "\n".join(tbl) + "</pre>"]
     else:
-        lines += ["⚠️ 暫時搵唔到日本市場價格", ""]
+        lines += ["", "⚠️ 暫時無市場數據"]
 
     if req.is_psa and req.psa_grade:
-        lines += [f"🏅 *PSA {req.psa_grade}*", ""]
+        lines.append(f"🏅 PSA {req.psa_grade}")
 
     if summary:
         lines += [
-            "💰 *建議*",
-            f"建議買入：HK${summary['recommended_buy']:,}",
-            f"建議賣出：HK${summary['recommended_sell']:,}",
-            f"信心度：{'🟢' if summary['confidence'] == 'high' else '🟡'} {summary['confidence'].upper()}",
             "",
+            f"💰 建議買入：<b>HK${summary['recommended_buy']:,}</b>　建議賣出：<b>HK${summary['recommended_sell']:,}</b>",
+            f"信心度：{'🟢' if summary['confidence'] == 'high' else '🟡'} {summary['confidence'].upper()}",
         ]
 
-    lines.append("⚠️ 需要人手確認後再報價")
     return "\n".join(lines)
