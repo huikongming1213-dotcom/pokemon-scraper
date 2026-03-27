@@ -287,10 +287,12 @@ async def _scrape_card_rush(card_number: str) -> dict:
     """
     Playwright + Cloudflare stealth。
     返回所有 listing，按 grade 分組 min/max/avg，並標記在庫狀態。
+    返回 {"status": "blocked"} 或 {"status": "no_results"} 以區分失敗原因。
     """
     page = await _stealth_context.new_page()
     try:
         await page.add_init_script(_CR_STEALTH_SCRIPT)
+        await page.set_extra_http_headers({"Referer": "https://www.google.co.jp/"})
         q = quote(card_number)
         await page.goto(
             f"https://www.cardrush-pokemon.jp/product-list?keyword={q}&Submit=%E6%A4%9C%E7%B4%A2",
@@ -299,16 +301,17 @@ async def _scrape_card_rush(card_number: str) -> dict:
         )
 
         # 等待真實頁面載入（Cloudflare challenge 需要時間 solve）
-        # 等到 .selling_price 出現，或最多等 20 秒
         try:
             await page.wait_for_selector(".selling_price, .goods_name", timeout=20000)
         except Exception:
-            pass  # timeout — 繼續，讓後面 evaluate 決定有無結果
+            pass
 
-        # 診斷：記錄頁面標題（方便 debug Cloudflare 問題）
+        # Health check：區分 Cloudflare block 同真正無結果
         title = await page.title()
-        if "moment" in title.lower() or "cloudflare" in title.lower() or not title:
-            # 仍在 challenge page，等多 10 秒再試
+        if not title or "moment" in title.lower() or "cloudflare" in title.lower() or "verify" in title.lower():
+            return {"status": "blocked", "reason": "cloudflare_challenge"}
+
+        if "just a moment" in title.lower():
             await page.wait_for_timeout(10000)
 
         raw = await page.evaluate("""() => {
@@ -358,7 +361,7 @@ async def _scrape_card_rush(card_number: str) -> dict:
             })
 
         if not listings:
-            return {}
+            return {"status": "no_results"}
 
         # 分組統計
         by_grade: dict[str, list[int]] = {}
@@ -377,6 +380,7 @@ async def _scrape_card_rush(card_number: str) -> dict:
 
         all_prices = [l["price_jpy"] for l in listings]
         return {
+            "status":        "ok",
             "listing_count": len(listings),
             "by_grade":      grade_stats,
             "overall": {
@@ -426,10 +430,12 @@ async def _scrape_mercari_tw(card_number: str) -> dict:
     Playwright + stealth context，爬 Mercari TW。
     用 DOM 直接提取價格（Mercari 已改 Next.js App Router，無 initialItems script tag）。
     返回在售 / 已售各自 min/max/avg (NTD + HKD)。
+    返回 {"status": "no_results"} 區分真正無貨。
     """
     page = await _stealth_context.new_page()
     try:
         await page.add_init_script(_CR_STEALTH_SCRIPT)
+        await page.set_extra_http_headers({"Referer": "https://www.google.com.tw/"})
         q = quote(card_number)
         await page.goto(
             f"https://tw.mercari.com/zh-hant/search?keyword={q}",
@@ -472,7 +478,7 @@ async def _scrape_mercari_tw(card_number: str) -> dict:
         sold    = [d["price"] for d in items_data if     d["is_sold"]]
 
         if not on_sale and not sold:
-            return {}
+            return {"status": "no_results"}
 
         twd_rate = await _get_twd_hkd_rate()
 
@@ -485,10 +491,11 @@ async def _scrape_mercari_tw(card_number: str) -> dict:
             }
 
         return {
-            "currency":    "TWD",
+            "status":       "ok",
+            "currency":     "TWD",
             "twd_hkd_rate": twd_rate,
-            "on_sale":     _with_hkd(_mercari_stats(on_sale))  if on_sale else None,
-            "sold":        _with_hkd(_mercari_stats(sold))     if sold    else None,
+            "on_sale":      _with_hkd(_mercari_stats(on_sale)) if on_sale else None,
+            "sold":         _with_hkd(_mercari_stats(sold))    if sold    else None,
         }
 
     except Exception as e:
@@ -545,6 +552,11 @@ async def mercari_search(
     """Mercari TW 獨立查詢，返回在售/已售 min/max/avg（TWD + HKD）。"""
     try:
         result = await _scrape_mercari_tw(cardNumber)
+        status = result.get("status") if result else None
+        if status == "no_results":
+            return {"card_number": cardNumber, "message": "no results found"}
+        if status == "blocked":
+            return {"card_number": cardNumber, "message": "scraper blocked", "reason": result.get("reason")}
         if not result:
             return {"card_number": cardNumber, "message": "no results found"}
         return result
@@ -559,6 +571,11 @@ async def card_rush_search(
     """Card Rush 獨立查詢，返回各 grade min/max/avg（含 HKD 換算）及在庫狀態。"""
     try:
         rates, result = await asyncio.gather(_get_rates(), _scrape_card_rush(cardNumber))
+        status = result.get("status") if result else None
+        if status == "no_results":
+            return {"card_number": cardNumber, "message": "no results found"}
+        if status == "blocked":
+            return {"card_number": cardNumber, "message": "scraper blocked", "reason": result.get("reason")}
         if not result:
             return {"card_number": cardNumber, "message": "no results found"}
         for stats in result.get("by_grade", {}).values():
