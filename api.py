@@ -144,7 +144,7 @@ async def _page_prices(page, min_val=200, max_val=5_000_000) -> list[int]:
 
 # ── Scraper 1: 遊々亭 ─────────────────────────────────────────────────────
 
-async def _scrape_yuyu_tei(card_number: str) -> dict:
+async def _scrape_yuyu_tei(card_number: str, card_name: str = "") -> dict:
     page = await _browser.new_page()
     try:
         await page.goto("https://yuyu-tei.jp/sell/poc/s/search")
@@ -157,16 +157,23 @@ async def _scrape_yuyu_tei(card_number: str) -> dict:
                 break
         await page.wait_for_load_state("networkidle", timeout=25000)
 
+        # 準備 card_name keywords 做 filter（取第一個字，通常係 Pokemon 名）
+        name_keywords = [k for k in card_name.split() if len(k) > 1] if card_name else []
+
         cards = await page.query_selector_all(".card-product")
         for card in cards:
             name_el  = await card.query_selector("h4")
             price_el = await card.query_selector("strong.d-block")
             name      = (await name_el.inner_text()).strip()  if name_el  else None
             price_str = (await price_el.inner_text()).strip() if price_el else None
-            if price_str:
-                digits = re.sub(r"[^\d]", "", price_str)
-                if digits:
-                    return {"price_jpy": int(digits), "name": name}
+            if not price_str or not name:
+                continue
+            # 如果有卡名，check 結果 name 係咪包含任何 keyword
+            if name_keywords and not any(kw in name for kw in name_keywords):
+                continue
+            digits = re.sub(r"[^\d]", "", price_str)
+            if digits:
+                return {"price_jpy": int(digits), "name": name}
 
         return {}  # 搵唔到但唔係 error
     except Exception as e:
@@ -219,6 +226,9 @@ async def _scrape_snkr_dunk(card_number: str, card_name: str = "") -> dict:
     if not products:
         return {}
 
+    # 準備 card_name keywords 做 filter
+    name_keywords = [k for k in card_name.split() if len(k) > 1] if card_name else []
+
     listings = [
         {
             "price_jpy": p["salePrice"],
@@ -227,6 +237,7 @@ async def _scrape_snkr_dunk(card_number: str, card_name: str = "") -> dict:
         }
         for p in products
         if p.get("salePrice", 0) > 0
+        and (not name_keywords or any(kw in (p.get("title") or "") for kw in name_keywords))
     ]
 
     if not listings:
@@ -284,29 +295,36 @@ def _parse_cr_grade(name: str) -> str:
     return tag.replace("鑑定済", "").replace("※状態難/", "").strip() or "raw"
 
 
-async def _scrape_card_rush(card_number: str) -> dict:
+async def _scrape_card_rush(card_number: str, card_name: str = "") -> dict:
     """Apify Cheerio Scraper + RESIDENTIAL proxy，bypass Cloudflare。"""
     apify_token = os.environ.get("APIFY_API_TOKEN", "")
     if not apify_token:
         raise RuntimeError("APIFY_API_TOKEN not set")
 
+    # 取第一個 keyword 做 filter（通常係 Pokemon 名）
+    name_filter = card_name.split()[0] if card_name else ""
+
     q = quote(card_number, safe="")
+    page_func = f"""async function pageFunction(context) {{
+        const {{ $ }} = context;
+        const nameFilter = {json.dumps(name_filter)};
+        const results = [];
+        $('.selling_price').each((i, el) => {{
+            const li = $(el).closest('li');
+            const name = li.find('.goods_name').text().trim();
+            const price = li.find('.figure').text().trim();
+            const stock = li.find('.stock').text().trim();
+            if (!price) return;
+            if (nameFilter && !name.includes(nameFilter)) return;
+            results.push({{ name, price, stock }});
+        }});
+        return results;
+    }}"""
     payload = {
         "startUrls": [
             {"url": f"https://www.cardrush-pokemon.jp/product-list?keyword={q}&Submit=%E6%A4%9C%E7%B4%A2"}
         ],
-        "pageFunction": """async function pageFunction(context) {
-            const { $ } = context;
-            const results = [];
-            $('.selling_price').each((i, el) => {
-                const li = $(el).closest('li');
-                const name = li.find('.goods_name').text().trim();
-                const price = li.find('.figure').text().trim();
-                const stock = li.find('.stock').text().trim();
-                if (price) results.push({ name, price, stock });
-            });
-            return results;
-        }""",
+        "pageFunction": page_func,
         "proxyConfiguration": {
             "useApifyProxy": True,
             "apifyProxyGroups": ["RESIDENTIAL"]
@@ -618,9 +636,9 @@ async def price_report(req: PriceReportRequest):
             return {}
 
     rates = await _get_rates()
-    yuyu  = await _safe(_scrape_yuyu_tei(req.card_number), "yuyu_tei", timeout=35)
+    yuyu  = await _safe(_scrape_yuyu_tei(req.card_number, req.card_name), "yuyu_tei", timeout=35)
     snkr  = await _safe(_scrape_snkr_dunk(req.card_number, req.card_name), "snkr_dunk", timeout=20)
-    rush  = await _safe(_scrape_card_rush(req.card_number), "card_rush", timeout=120)
+    rush  = await _safe(_scrape_card_rush(req.card_number, req.card_name), "card_rush", timeout=120)
     merc  = await _safe(_scrape_mercari_tw(req.card_number, req.card_name), "mercari_tw", timeout=60)
 
     # ── 組裝 sources ──
