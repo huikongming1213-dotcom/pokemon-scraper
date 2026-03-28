@@ -5,6 +5,7 @@ Pokemon Card Price Scraper
 from contextlib import asynccontextmanager
 import asyncio
 import json
+import os
 import re
 import time
 from datetime import datetime, timezone, timedelta
@@ -197,12 +198,12 @@ def _grade_stats(listings: list[dict], grade_key: str) -> dict | None:
     }
 
 
-async def _scrape_snkr_dunk(card_number: str) -> dict:
+async def _scrape_snkr_dunk(card_number: str, card_name: str = "") -> dict:
     """
     純 httpx，唔使 Playwright。
     返回所有 listing，並按 PSA8/PSA9/PSA10/raw 分組統計 min/max/avg。
     """
-    q = quote(card_number)
+    q = quote(f"{card_name} {card_number}".strip() if card_name else card_number)
     url = (
         f"https://snkrdunk.com/v3/search"
         f"?func=all&refId=search&cardVersion=2&sortKey=default"
@@ -251,7 +252,7 @@ async def _scrape_snkr_dunk(card_number: str) -> dict:
     }
 
 
-# ── Scraper 3: Card Rush ──────────────────────────────────────────────────
+# ── Scraper 3: Card Rush (Apify Cheerio + RESIDENTIAL proxy) ─────────────
 
 _CR_STEALTH_SCRIPT = """
 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
@@ -284,117 +285,91 @@ def _parse_cr_grade(name: str) -> str:
 
 
 async def _scrape_card_rush(card_number: str) -> dict:
-    """
-    Playwright + Cloudflare stealth。
-    返回所有 listing，按 grade 分組 min/max/avg，並標記在庫狀態。
-    返回 {"status": "blocked"} 或 {"status": "no_results"} 以區分失敗原因。
-    """
-    page = await _stealth_context.new_page()
-    try:
-        await page.add_init_script(_CR_STEALTH_SCRIPT)
-        await page.set_extra_http_headers({"Referer": "https://www.google.co.jp/"})
-        q = quote(card_number)
-        await page.goto(
-            f"https://www.cardrush-pokemon.jp/product-list?keyword={q}&Submit=%E6%A4%9C%E7%B4%A2",
-            wait_until="domcontentloaded",
-            timeout=35000,
-        )
+    """Apify Cheerio Scraper + RESIDENTIAL proxy，bypass Cloudflare。"""
+    apify_token = os.environ.get("APIFY_API_TOKEN", "")
+    if not apify_token:
+        raise RuntimeError("APIFY_API_TOKEN not set")
 
-        # 等待真實頁面載入（Cloudflare challenge 需要時間 solve）
-        try:
-            await page.wait_for_selector(".selling_price, .goods_name", timeout=20000)
-        except Exception:
-            pass
-
-        # Health check：區分 Cloudflare block 同真正無結果
-        title = await page.title()
-        if not title or "moment" in title.lower() or "cloudflare" in title.lower() or "verify" in title.lower():
-            return {"status": "blocked", "reason": "cloudflare_challenge"}
-
-        if "just a moment" in title.lower():
-            await page.wait_for_timeout(10000)
-
-        raw = await page.evaluate("""() => {
+    q = quote(card_number, safe="")
+    payload = {
+        "startUrls": [
+            {"url": f"https://www.cardrush-pokemon.jp/product-list?keyword={q}&Submit=%E6%A4%9C%E7%B4%A2"}
+        ],
+        "pageFunction": """async function pageFunction(context) {
+            const { $ } = context;
             const results = [];
-            // 主 selector
-            document.querySelectorAll(".selling_price").forEach(priceEl => {
-                const li      = priceEl.closest("li") || priceEl.parentElement;
-                const nameEl  = li.querySelector(".goods_name");
-                const stockEl = li.querySelector(".stock");
-                const figEl   = priceEl.querySelector(".figure");
-                results.push({
-                    name:  nameEl ? nameEl.innerText.trim() : "",
-                    price: figEl  ? figEl.innerText.trim()  : "",
-                    stock: stockEl ? stockEl.innerText.trim() : "",
-                    _src: "selling_price",
-                });
+            $('.selling_price').each((i, el) => {
+                const li = $(el).closest('li');
+                const name = li.find('.goods_name').text().trim();
+                const price = li.find('.figure').text().trim();
+                const stock = li.find('.stock').text().trim();
+                if (price) results.push({ name, price, stock });
             });
-            // Fallback：搵任何含日圓價格嘅元素
-            if (results.length === 0) {
-                document.querySelectorAll("[class*='price'],[class*='Price']").forEach(el => {
-                    const t = el.innerText.trim();
-                    if (/[¥￥][\d,]{3,}|[\d,]{3,}円/.test(t)) {
-                        const li = el.closest("li") || el.parentElement;
-                        const nameEl = li ? li.querySelector("[class*='name'],[class*='Name']") : null;
-                        results.push({
-                            name:  nameEl ? nameEl.innerText.trim() : "",
-                            price: t,
-                            stock: "",
-                            _src: "fallback",
-                        });
-                    }
-                });
-            }
             return results;
-        }""")
-
-        listings = []
-        for item in raw:
-            digits = re.sub(r"[^\d]", "", item["price"])
-            if not digits:
-                continue
-            listings.append({
-                "price_jpy": int(digits),
-                "grade":     _parse_cr_grade(item["name"]),
-                "in_stock":  item["stock"] != "×" and "在庫" in item["stock"],
-                "name":      item["name"],
-            })
-
-        if not listings:
-            return {"status": "no_results"}
-
-        # 分組統計
-        by_grade: dict[str, list[int]] = {}
-        for l in listings:
-            by_grade.setdefault(l["grade"], []).append(l["price_jpy"])
-
-        grade_stats = {
-            grade: {
-                "count":   len(prices),
-                "min_jpy": min(prices),
-                "max_jpy": max(prices),
-                "avg_jpy": round(sum(prices) / len(prices)),
-            }
-            for grade, prices in by_grade.items()
+        }""",
+        "proxyConfiguration": {
+            "useApifyProxy": True,
+            "apifyProxyGroups": ["RESIDENTIAL"]
         }
+    }
 
-        all_prices = [l["price_jpy"] for l in listings]
-        return {
-            "status":        "ok",
-            "listing_count": len(listings),
-            "by_grade":      grade_stats,
-            "overall": {
-                "min_jpy": min(all_prices),
-                "max_jpy": max(all_prices),
-                "avg_jpy": round(sum(all_prices) / len(all_prices)),
-            },
-            "listings": listings,
+    async with httpx.AsyncClient(timeout=120) as client:
+        r = await client.post(
+            "https://api.apify.com/v2/acts/apify~cheerio-scraper/run-sync-get-dataset-items",
+            params={"token": apify_token},
+            json=payload,
+        )
+        r.raise_for_status()
+        items = r.json()
+
+    # dataset items 係 nested：[[{...}, ...]]
+    raw = []
+    for page_result in items:
+        if isinstance(page_result, list):
+            raw.extend(page_result)
+        elif isinstance(page_result, dict):
+            raw.append(page_result)
+
+    listings = []
+    for item in raw:
+        digits = re.sub(r"[^\d]", "", item.get("price", ""))
+        if not digits:
+            continue
+        listings.append({
+            "price_jpy": int(digits),
+            "grade":     _parse_cr_grade(item.get("name", "")),
+            "in_stock":  item.get("stock", "") != "×" and "在庫" in item.get("stock", ""),
+            "name":      item.get("name", ""),
+        })
+
+    if not listings:
+        return {}
+
+    by_grade: dict[str, list[int]] = {}
+    for l in listings:
+        by_grade.setdefault(l["grade"], []).append(l["price_jpy"])
+
+    grade_stats = {
+        grade: {
+            "count":   len(prices),
+            "min_jpy": min(prices),
+            "max_jpy": max(prices),
+            "avg_jpy": round(sum(prices) / len(prices)),
         }
+        for grade, prices in by_grade.items()
+    }
 
-    except Exception as e:
-        raise RuntimeError(f"card_rush failed: {type(e).__name__}: {e}")
-    finally:
-        await page.close()
+    all_prices = [l["price_jpy"] for l in listings]
+    return {
+        "listing_count": len(listings),
+        "by_grade":      grade_stats,
+        "overall": {
+            "min_jpy": min(all_prices),
+            "max_jpy": max(all_prices),
+            "avg_jpy": round(sum(all_prices) / len(all_prices)),
+        },
+        "listings": listings,
+    }
 
 
 # ── Scraper 4: Mercari TW ────────────────────────────────────────────────
@@ -425,7 +400,7 @@ async def _get_twd_hkd_rate() -> float:
         return 0.24  # fallback
 
 
-async def _scrape_mercari_tw(card_number: str) -> dict:
+async def _scrape_mercari_tw(card_number: str, card_name: str = "") -> dict:
     """
     Playwright + stealth context，爬 Mercari TW。
     用 DOM 直接提取價格（Mercari 已改 Next.js App Router，無 initialItems script tag）。
@@ -436,7 +411,7 @@ async def _scrape_mercari_tw(card_number: str) -> dict:
     try:
         await page.add_init_script(_CR_STEALTH_SCRIPT)
         await page.set_extra_http_headers({"Referer": "https://www.google.com.tw/"})
-        q = quote(card_number)
+        q = quote(f"{card_name} {card_number}".strip() if card_name else card_number)
         await page.goto(
             f"https://tw.mercari.com/zh-hant/search?keyword={q}",
             wait_until="domcontentloaded",
@@ -543,15 +518,16 @@ async def search(
         raise HTTPException(status_code=500, detail=str(e))
 
 
-# ── GET /snkr-dunk ────────────────────────────────────────────────────────
+# ── GET /mercari ──────────────────────────────────────────────────────────
 
 @app.get("/mercari")
 async def mercari_search(
     cardNumber: str = Query(..., example="288/SM-P"),
+    cardName:   str = Query(default="", example="リザードンex"),
 ):
     """Mercari TW 獨立查詢，返回在售/已售 min/max/avg（TWD + HKD）。"""
     try:
-        result = await _scrape_mercari_tw(cardNumber)
+        result = await _scrape_mercari_tw(cardNumber, cardName)
         status = result.get("status") if result else None
         if status == "no_results":
             return {"card_number": cardNumber, "message": "no results found"}
@@ -564,6 +540,8 @@ async def mercari_search(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ── GET /card-rush ────────────────────────────────────────────────────────
+
 @app.get("/card-rush")
 async def card_rush_search(
     cardNumber: str = Query(..., example="288/SM-P"),
@@ -571,11 +549,6 @@ async def card_rush_search(
     """Card Rush 獨立查詢，返回各 grade min/max/avg（含 HKD 換算）及在庫狀態。"""
     try:
         rates, result = await asyncio.gather(_get_rates(), _scrape_card_rush(cardNumber))
-        status = result.get("status") if result else None
-        if status == "no_results":
-            return {"card_number": cardNumber, "message": "no results found"}
-        if status == "blocked":
-            return {"card_number": cardNumber, "message": "scraper blocked", "reason": result.get("reason")}
         if not result:
             return {"card_number": cardNumber, "message": "no results found"}
         for stats in result.get("by_grade", {}).values():
@@ -592,13 +565,16 @@ async def card_rush_search(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ── GET /snkr-dunk ────────────────────────────────────────────────────────
+
 @app.get("/snkr-dunk")
 async def snkr_dunk_search(
     cardNumber: str = Query(..., example="288/SM-P"),
+    cardName:   str = Query(default="", example="リザードンex"),
 ):
     """SNKR Dunk 獨立查詢，返回 PSA8/PSA9/PSA10/raw 分組 min/max/avg（含 HKD 換算）。"""
     try:
-        rates, result = await asyncio.gather(_get_rates(), _scrape_snkr_dunk(cardNumber))
+        rates, result = await asyncio.gather(_get_rates(), _scrape_snkr_dunk(cardNumber, cardName))
         if not result:
             return {"card_number": cardNumber, "message": "no results found"}
         for grade, stats in result.get("by_grade", {}).items():
@@ -634,18 +610,18 @@ async def price_report(req: PriceReportRequest):
     # 順序執行，避免並行開多個 Playwright page 導致 RAM 爆
     errors = {}
 
-    async def _safe(coro, key):
+    async def _safe(coro, key, timeout=30):
         try:
-            return await asyncio.wait_for(coro, timeout=25) or {}
+            return await asyncio.wait_for(coro, timeout=timeout) or {}
         except Exception as e:
             errors[key] = str(e)
             return {}
 
     rates = await _get_rates()
-    yuyu  = await _safe(_scrape_yuyu_tei(req.card_number), "yuyu_tei")
-    snkr  = await _safe(_scrape_snkr_dunk(req.card_number), "snkr_dunk")
-    rush  = await _safe(_scrape_card_rush(req.card_number), "card_rush")
-    merc  = await _safe(_scrape_mercari_tw(req.card_number), "mercari_tw")
+    yuyu  = await _safe(_scrape_yuyu_tei(req.card_number), "yuyu_tei", timeout=35)
+    snkr  = await _safe(_scrape_snkr_dunk(req.card_number, req.card_name), "snkr_dunk", timeout=20)
+    rush  = await _safe(_scrape_card_rush(req.card_number), "card_rush", timeout=120)
+    merc  = await _safe(_scrape_mercari_tw(req.card_number, req.card_name), "mercari_tw", timeout=60)
 
     # ── 組裝 sources ──
     def _yuyu_out(r):
@@ -804,6 +780,32 @@ def _fmt_tg(card_label, ts, sources, summary, req) -> str:
         lines += ["", "<pre>" + "\n".join(tbl) + "</pre>"]
     else:
         lines += ["", "⚠️ 暫時無市場數據"]
+
+    # PSA 分級均價表（Card Rush / SNKR Dunk by_grade）
+    psa_rows = []
+    for src_name, src_key in [("Card Rush", "card_rush"), ("SNKR Dunk", "snkr_dunk")]:
+        src = sources.get(src_key)
+        if not src or not src.get("by_grade"):
+            continue
+        bg = src["by_grade"]
+        p8  = bg.get("PSA8",  {}).get("avg_hkd")
+        p9  = bg.get("PSA9",  {}).get("avg_hkd")
+        p10 = bg.get("PSA10", {}).get("avg_hkd")
+        if p8 or p9 or p10:
+            psa_rows.append((src_name, p8, p9, p10))
+
+    if psa_rows:
+        C2 = 12
+        hdr2 = _rpad("來源", C2) + _rpad("PSA8", 6) + _rpad("PSA9", 6) + "PSA10"
+        sep2 = "─" * (C2 + 6 + 6 + 5)
+        tbl2 = [hdr2, sep2] + [
+            _rpad(n, C2)
+            + _rpad(str(p8)  if p8  else "—", 6)
+            + _rpad(str(p9)  if p9  else "—", 6)
+            + (str(p10) if p10 else "—")
+            for n, p8, p9, p10 in psa_rows
+        ]
+        lines += ["", "🏅 PSA 分級均價（HKD）", "<pre>" + "\n".join(tbl2) + "</pre>"]
 
     if req.is_psa and req.psa_grade:
         lines.append(f"🏅 PSA {req.psa_grade}")
