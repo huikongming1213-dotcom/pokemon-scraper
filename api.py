@@ -340,28 +340,36 @@ async def _scrape_card_rush(card_number: str, card_name: str = "") -> dict:
     if not apify_token:
         raise RuntimeError("APIFY_API_TOKEN not set")
 
-    name_filter = card_name.split()[0] if card_name else ""
+    name_filter   = card_name.split()[0] if card_name else ""
+    # card_number 直接用原始值做 row-text filter（唔 quote，因為係 JS string 比較）
+    number_filter = card_number  # e.g. "110/080"
 
-    q_name   = quote(card_name,   safe="")
-    q_number = quote(card_number, safe="")
-
-    # 分開兩個 field：商品名 + 型番
+    # 只帶卡名入 keyword，card number 靠 pageFunction 過濾 row text
+    # （keyword2 field name 唔確定，直接喺 JS 側 check 更可靠）
+    q_name = quote(card_name, safe="")
     search_url = (
         f"https://www.cardrush-pokemon.jp/product-list"
-        f"?keyword={q_name}&keyword2={q_number}&Submit=%E6%A4%9C%E7%B4%A2"
+        f"?keyword={q_name}&Submit=%E6%A4%9C%E7%B4%A2"
     )
 
     page_func = f"""async function pageFunction(context) {{
         const {{ $ }} = context;
-        const nameFilter = {json.dumps(name_filter)};
+        const nameFilter   = {json.dumps(name_filter)};
+        const numberFilter = {json.dumps(number_filter)};
         const results = [];
         $('.selling_price').each((i, el) => {{
             const li = $(el).closest('li');
-            const name = li.find('.goods_name').text().trim();
+            const name  = li.find('.goods_name').text().trim();
             const price = li.find('.figure').text().trim();
             const stock = li.find('.stock').text().trim();
             if (!price) return;
+            // 卡名 filter（取第一個 keyword）
             if (nameFilter && !name.includes(nameFilter)) return;
+            // 型番 filter：整行 text 必須包含卡號（e.g. "110/080"）
+            if (numberFilter) {{
+                const rowText = li.text();
+                if (!rowText.includes(numberFilter)) return;
+            }}
             results.push({{ name, price, stock }});
         }});
         return results;
@@ -462,19 +470,31 @@ async def _get_twd_hkd_rate() -> float:
         return 0.24
 
 
+def _mercari_grade_stats(listings: list[dict], grade: str, sold: bool) -> dict | None:
+    """Mercari 用 TWD，計算某 grade + 在售/已售 嘅 min/max/avg"""
+    items = [l["price"] for l in listings if l["grade"] == grade and l["is_sold"] == sold]
+    if not items:
+        return None
+    return {
+        "count":   len(items),
+        "min_twd": min(items),
+        "max_twd": max(items),
+        "avg_twd": round(sum(items) / len(items)),
+    }
+
+
 async def _scrape_mercari_tw(card_number: str, card_name: str = "", rarity: str = "") -> dict:
     """
     Playwright + stealth context，爬 Mercari TW。
-    FIX: search keyword 包含 rarity，例如 "メガリザードンXex 110/080 SAR"，
-         避免出波鞋等完全無關嘅搜尋結果。
-    返回在售 / 已售各自 min/max/avg (NTD + HKD)。
+    - search keyword 包含 rarity 過濾無關商品
+    - JS 從每個 listing 附近文字提取 PSA grade
+    - 返回在售/已售 overall + by_grade 分組（TWD + HKD）
     """
     page = await _stealth_context.new_page()
     try:
         await page.add_init_script(_CR_STEALTH_SCRIPT)
         await page.set_extra_http_headers({"Referer": "https://www.google.com.tw/"})
 
-        # FIX: 組合完整搜尋字串，加入 rarity
         keyword_parts = " ".join(filter(None, [card_name, card_number, rarity]))
         q = quote(keyword_parts or card_number)
 
@@ -502,17 +522,22 @@ async def _scrape_mercari_tw(card_number: str, card_name: str = "", rarity: str 
                     if (m) price = parseInt(m[1].replace(/,/g, ''));
                 }
                 if (price < 50 || price > 50000000) continue;
-                const ctx = lines.slice(Math.max(0, i - 8), i + 2).join(' ');
+
+                // 往前後各 10 行搵 sold 狀態 + PSA grade
+                const ctx = lines.slice(Math.max(0, i - 10), i + 3).join(' ');
                 const isSold = ctx.includes('已售出') || ctx.includes('SOLD') || ctx.includes('Sold out');
-                results.push({ price, is_sold: isSold });
+
+                // 提取 PSA grade：優先抓 PSA + 數字，否則 raw
+                const psaMatch = ctx.match(/PSA\s*(\d+)/i);
+                const grade = psaMatch ? ('PSA' + psaMatch[1]) : 'raw';
+
+                results.push({ price, is_sold: isSold, grade });
             }
-            return results;
+            // 推薦排序頭 20 個 listing 已足夠，避免低質/無關結果污染統計
+            return results.slice(0, 20);
         }""")
 
-        on_sale = [d["price"] for d in items_data if not d["is_sold"]]
-        sold    = [d["price"] for d in items_data if     d["is_sold"]]
-
-        if not on_sale and not sold:
+        if not items_data:
             return {"status": "no_results"}
 
         twd_rate = await _get_twd_hkd_rate()
@@ -525,12 +550,31 @@ async def _scrape_mercari_tw(card_number: str, card_name: str = "", rarity: str 
                 "avg_hkd": round(stats["avg_twd"] * twd_rate),
             }
 
+        on_sale_prices = [d["price"] for d in items_data if not d["is_sold"]]
+        sold_prices    = [d["price"] for d in items_data if     d["is_sold"]]
+
+        if not on_sale_prices and not sold_prices:
+            return {"status": "no_results"}
+
+        # ── by_grade 分組：每個 grade 分別統計在售/已售 ──
+        all_grades = sorted({d["grade"] for d in items_data})
+        by_grade = {}
+        for g in all_grades:
+            on_s = _mercari_grade_stats(items_data, g, sold=False)
+            so   = _mercari_grade_stats(items_data, g, sold=True)
+            if on_s or so:
+                by_grade[g] = {
+                    "on_sale": _with_hkd(on_s) if on_s else None,
+                    "sold":    _with_hkd(so)   if so   else None,
+                }
+
         return {
             "status":       "ok",
             "currency":     "TWD",
             "twd_hkd_rate": twd_rate,
-            "on_sale":      _with_hkd(_mercari_stats(on_sale)) if on_sale else None,
-            "sold":         _with_hkd(_mercari_stats(sold))    if sold    else None,
+            "on_sale":      _with_hkd(_mercari_stats(on_sale_prices)) if on_sale_prices else None,
+            "sold":         _with_hkd(_mercari_stats(sold_prices))    if sold_prices    else None,
+            "by_grade":     by_grade,
         }
 
     except Exception as e:
@@ -853,10 +897,10 @@ def _fmt_tg(card_label, ts, sources, summary, req) -> str:
 
     if rows:
         C = 12
-        hdr = _rpad("來源", C) + _rpad("低", 6) + _rpad("高", 6) + "均(HKD)"
-        sep = "─" * (C + 6 + 6 + 7)
+        hdr = _rpad("來源", C) + _rpad("低", 8) + _rpad("高", 8) + "均(HKD)"
+        sep = "─" * (C + 8 + 8 + 7)
         tbl = [hdr, sep] + [
-            _rpad(n, C) + _rpad(str(lo), 6) + _rpad(str(hi), 6) + str(avg)
+            _rpad(n, C) + _rpad(str(lo), 8) + _rpad(str(hi), 8) + str(avg)
             for n, lo, hi, avg in rows
         ]
         lines += ["", "<pre>" + "\n".join(tbl) + "</pre>"]
@@ -864,6 +908,8 @@ def _fmt_tg(card_label, ts, sources, summary, req) -> str:
         lines += ["", "⚠️ 暫時無市場數據"]
 
     psa_rows = []
+
+    # Card Rush + SNKR Dunk：JPY sources，by_grade 直接有 avg_hkd
     for src_name, src_key in [("Card Rush", "card_rush"), ("SNKR Dunk", "snkr_dunk")]:
         src = sources.get(src_key)
         if not src or not src.get("by_grade"):
@@ -874,6 +920,19 @@ def _fmt_tg(card_label, ts, sources, summary, req) -> str:
         p10 = bg.get("PSA10", {}).get("avg_hkd")
         if p8 or p9 or p10:
             psa_rows.append((src_name, p8, p9, p10))
+
+    # Mercari TW：by_grade 每個 grade 有 on_sale / sold，優先用 on_sale avg_hkd
+    merc_src = sources.get("mercari")
+    if merc_src and merc_src.get("by_grade"):
+        def _merc_grade_hkd(grade_data: dict) -> int | None:
+            s = grade_data.get("on_sale") or grade_data.get("sold")
+            return s.get("avg_hkd") if s else None
+        bg = merc_src["by_grade"]
+        p8  = _merc_grade_hkd(bg.get("PSA8",  {}))
+        p9  = _merc_grade_hkd(bg.get("PSA9",  {}))
+        p10 = _merc_grade_hkd(bg.get("PSA10", {}))
+        if p8 or p9 or p10:
+            psa_rows.append(("Mercari TW", p8, p9, p10))
 
     if psa_rows:
         C2 = 12
