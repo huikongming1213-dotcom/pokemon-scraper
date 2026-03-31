@@ -1,0 +1,23 @@
+{
+  "permissions": {
+    "allow": [
+      "WebFetch(domain:huikongming.zeabur.app)",
+      "Bash(curl -s \"https://pokemon-scraper.zeabur.app/card-rush?cardNumber=234%2F193\")",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(json.dumps\\(d, indent=2, ensure_ascii=False\\)\\)\")",
+      "Bash(curl -s \"https://pokemon-scraper.zeabur.app/mercari?cardNumber=234%2F193\")",
+      "Bash(curl -s \"https://pokemon-scraper.zeabur.app/debug/html?url=https://www.cardrush-pokemon.jp/product-list?keyword=234%2F193%26Submit=%E6%A4%9C%E7%B4%A2\")",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(''''TITLE:'''', d.get\\(''''title'''',''''''''\\)\\); print\\(''''\\\\nPRICE LINES:''''\\); [print\\(l\\) for l in d.get\\(''''price_lines'''',[]\\)]\")",
+      "Bash(curl -s \"https://pokemon-scraper.zeabur.app/debug/html?url=https://tw.mercari.com/zh-hant/search?keyword=234%2F193\")",
+      "Bash(python -c \"import sys,json; d=json.load\\(sys.stdin\\); print\\(''''TITLE:'''', d.get\\(''''title'''',''''''''\\)\\); print\\(''''\\\\nPRICE LINES:''''\\); [print\\(l\\) for l in d.get\\(''''price_lines'''',[][:20]\\)]\")",
+      "Bash(python -c \":*)",
+      "Bash(curl -I --max-time 10 \"https://www.cardrush-pokemon.jp/\")",
+      "Bash(curl -s --max-time 30 \"https://pokemon-scraper.zeabur.app/debug/html?url=https://tw.mercari.com/zh-hant/search?keyword=234%2F193\")",
+      "Bash(curl -s --max-time 60 \"https://pokemon-scraper.zeabur.app/debug/html?url=https://www.cardrush-pokemon.jp/product-list?keyword=234%2F193%26Submit=%E6%A4%9C%E7%B4%A2\")",
+      "Bash(curl -s \"https://pokemon-scraper.zeabur.app/card-rush?cardNumber=001%2F098\")",
+      "Bash(curl -s \"https://pokemon-scraper.zeabur.app/card-rush?cardNumber=pikachu\")",
+      "Bash(Start-Sleep -Seconds 100)",
+      "Bash(curl -s --max-time 90 https://pokemon-scraper.zeabur.app/mercari?cardNumber=234%2F193)",
+      "Bash(Start-Sleep -Seconds 60)"
+    ]
+  }
+}

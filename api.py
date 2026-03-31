@@ -79,6 +79,26 @@ def _jpy_to_hkd(jpy: int, rates: dict) -> int:
     return round(jpy * rates["JPY_HKD"])
 
 
+# ── Grade normalization ────────────────────────────────────────────────────
+
+def _normalize_grade(grade: str) -> str:
+    """
+    統一 grade 格式，避免 SNKR Dunk / Card Rush 輸出格式不一致。
+    "PSA 10" / "psa10" / "PSA10" → "PSA10"
+    其他 → 原樣返回（例如 "raw", "状態B"）
+    """
+    if not grade:
+        return "raw"
+    g = re.sub(r"\s+", "", grade).upper()
+    m = re.match(r"PSA(\d+)", g)
+    if m:
+        return f"PSA{m.group(1)}"
+    m2 = re.match(r"BGS([\d.]+)", g)
+    if m2:
+        return f"BGS{m2.group(1)}"
+    return grade  # 保留原格式（状態B, raw 等）
+
+
 # ── DEBUG endpoint (臨時用，睇真實 HTML 結構) ─────────────────────────────
 
 @app.get("/debug/html")
@@ -88,17 +108,14 @@ async def debug_html(url: str = Query(...)):
     try:
         await page.goto(url, wait_until="networkidle", timeout=30000)
 
-        # 返回 body text（唔係完整 HTML，避免太大）
         body_text = await page.evaluate("() => document.body.innerText")
         inner_html = await page.evaluate("() => document.body.innerHTML")
 
-        # 搵含價格嘅行
         price_lines = [
             line.strip() for line in body_text.split("\n")
             if re.search(r"[¥￥円\$]|[\d,]{3,}", line) and line.strip()
         ][:50]
 
-        # 搵所有 class 名（幫助識別 selector）
         all_classes = await page.evaluate("""() => {
             const els = document.querySelectorAll('[class]');
             const classes = new Set();
@@ -106,12 +123,20 @@ async def debug_html(url: str = Query(...)):
             return [...classes].filter(c => c.length > 2 && c.length < 50).slice(0, 100);
         }""")
 
+        # 額外：dump 所有 input[name] 幫助識別 form fields
+        form_fields = await page.evaluate("""() => {
+            return [...document.querySelectorAll('input, select, textarea')]
+                .map(el => ({ tag: el.tagName, name: el.name, id: el.id, type: el.type, placeholder: el.placeholder }))
+                .filter(f => f.name || f.id);
+        }""")
+
         return {
             "url": url,
             "title": await page.title(),
             "price_lines": price_lines,
             "all_classes": all_classes,
-            "html_snippet": inner_html[:3000],  # 頭3000字
+            "form_fields": form_fields,
+            "html_snippet": inner_html[:3000],
         }
     except Exception as e:
         return {"error": str(e), "url": url}
@@ -122,7 +147,6 @@ async def debug_html(url: str = Query(...)):
 # ── Helper: extract JPY prices from raw page text ─────────────────────────
 
 async def _page_prices(page, min_val=200, max_val=5_000_000) -> list[int]:
-    """JS evaluation: 搵頁面內所有合理嘅日圓價格"""
     try:
         raw = await page.evaluate("""() => {
             const t = document.body.innerText || '';
@@ -142,22 +166,25 @@ async def _page_prices(page, min_val=200, max_val=5_000_000) -> list[int]:
         return []
 
 
-# ── Scraper 1: 遊々亭 ─────────────────────────────────────────────────────
+# ── Scraper 1: 遊々亭 (/buy/ = 店舖售價) ─────────────────────────────────
+# FIX: 改用 /buy/poc/s/search（市場售價），加 rare= 參數過濾 rarity
+# FIX: 搜尋字串同時帶 card_name，精確度更高
 
-async def _scrape_yuyu_tei(card_number: str, card_name: str = "") -> dict:
+async def _scrape_yuyu_tei(card_number: str, card_name: str = "", rarity: str = "") -> dict:
     page = await _browser.new_page()
     try:
-        await page.goto("https://yuyu-tei.jp/sell/poc/s/search")
-        inputs = page.locator('input[name="search_word"]')
-        for i in range(await inputs.count()):
-            inp = inputs.nth(i)
-            if await inp.is_visible():
-                await inp.fill(card_number)
-                await inp.press("Enter")
-                break
+        # 組合搜尋字串：卡名 + 卡號（同 SNKR Dunk / Mercari 一樣）
+        search_word = f"{card_name} {card_number}".strip() if card_name else card_number
+
+        # 組 URL：rare= 參數直接 filter rarity（遊々亭支援）
+        params = f"?search_word={quote(search_word)}"
+        if rarity:
+            params += f"&rare={quote(rarity)}"
+
+        await page.goto(f"https://yuyu-tei.jp/buy/poc/s/search{params}")
         await page.wait_for_load_state("networkidle", timeout=25000)
 
-        # 準備 card_name keywords 做 filter（取第一個字，通常係 Pokemon 名）
+        # card_name keywords 做二次 filter（取有意義的詞）
         name_keywords = [k for k in card_name.split() if len(k) > 1] if card_name else []
 
         cards = await page.query_selector_all(".card-product")
@@ -168,14 +195,13 @@ async def _scrape_yuyu_tei(card_number: str, card_name: str = "") -> dict:
             price_str = (await price_el.inner_text()).strip() if price_el else None
             if not price_str or not name:
                 continue
-            # 如果有卡名，check 結果 name 係咪包含任何 keyword
             if name_keywords and not any(kw in name for kw in name_keywords):
                 continue
             digits = re.sub(r"[^\d]", "", price_str)
             if digits:
                 return {"price_jpy": int(digits), "name": name}
 
-        return {}  # 搵唔到但唔係 error
+        return {}
     except Exception as e:
         raise RuntimeError(f"yuyu_tei failed: {type(e).__name__}: {e}")
     finally:
@@ -183,6 +209,7 @@ async def _scrape_yuyu_tei(card_number: str, card_name: str = "") -> dict:
 
 
 # ── Scraper 2: SNKR Dunk (pure httpx, no Playwright) ──────────────────────
+# FIX: search query 加入 rarity，避免出波鞋等無關結果
 
 _SNKR_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 Chrome/120 Safari/537.36",
@@ -192,25 +219,28 @@ _SNKR_HEADERS = {
 
 
 def _grade_stats(listings: list[dict], grade_key: str) -> dict | None:
-    """計算某 grade 的 min/max/avg/count"""
     items = [l for l in listings if l["grade"] == grade_key]
     if not items:
         return None
     prices = [l["price_jpy"] for l in items]
     return {
-        "count":       len(items),
-        "min_jpy":     min(prices),
-        "max_jpy":     max(prices),
-        "avg_jpy":     round(sum(prices) / len(prices)),
+        "count":   len(items),
+        "min_jpy": min(prices),
+        "max_jpy": max(prices),
+        "avg_jpy": round(sum(prices) / len(prices)),
     }
 
 
-async def _scrape_snkr_dunk(card_number: str, card_name: str = "") -> dict:
+async def _scrape_snkr_dunk(card_number: str, card_name: str = "", rarity: str = "") -> dict:
     """
     純 httpx，唔使 Playwright。
-    返回所有 listing，並按 PSA8/PSA9/PSA10/raw 分組統計 min/max/avg。
+    FIX: keyword = 卡名 + 卡號 + rarity，過濾無關商品（波鞋等）。
+    返回所有 listing，並按 PSA grade 分組統計 min/max/avg。
     """
-    q = quote(f"{card_name} {card_number}".strip() if card_name else card_number)
+    # 組合搜尋字串，包含 rarity
+    keyword_parts = " ".join(filter(None, [card_name, card_number, rarity]))
+    q = quote(keyword_parts or card_number)
+
     url = (
         f"https://snkrdunk.com/v3/search"
         f"?func=all&refId=search&cardVersion=2&sortKey=default"
@@ -226,13 +256,13 @@ async def _scrape_snkr_dunk(card_number: str, card_name: str = "") -> dict:
     if not products:
         return {}
 
-    # 準備 card_name keywords 做 filter
     name_keywords = [k for k in card_name.split() if len(k) > 1] if card_name else []
 
     listings = [
         {
             "price_jpy": p["salePrice"],
-            "grade":     p.get("condition") or "raw",
+            # FIX: normalize grade 格式，統一 "PSA 10" → "PSA10" 等
+            "grade":     _normalize_grade(p.get("condition") or "raw"),
             "name":      p.get("title", ""),
         }
         for p in products
@@ -243,7 +273,6 @@ async def _scrape_snkr_dunk(card_number: str, card_name: str = "") -> dict:
     if not listings:
         return {}
 
-    # 分組統計
     by_grade = {}
     for grade_key in ("PSA10", "PSA9", "PSA8", "PSA8以下", "raw"):
         stats = _grade_stats(listings, grade_key)
@@ -264,6 +293,8 @@ async def _scrape_snkr_dunk(card_number: str, card_name: str = "") -> dict:
 
 
 # ── Scraper 3: Card Rush (Apify Cheerio + RESIDENTIAL proxy) ─────────────
+# FIX: URL 同時帶 keyword（卡名）同 keyword2（型番/卡號），對應兩個獨立搜尋欄
+# ⚠️  keyword2 係根據 Card Rush 表單結構估計，部署前請用 /debug/html 確認 field name
 
 _CR_STEALTH_SCRIPT = """
 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
@@ -289,22 +320,37 @@ def _parse_cr_grade(name: str) -> str:
     tag = m.group(1)
     g = re.search(r"(PSA\d+|BGS[\d.]+|ARS\d+|PCG\d+|CGC\d+)", tag)
     if g:
-        return g.group(1)
+        # FIX: normalize 統一格式
+        return _normalize_grade(g.group(1))
     if "状態" in tag:
         return "状態" + tag.replace("状態", "").replace("※", "").strip()
     return tag.replace("鑑定済", "").replace("※状態難/", "").strip() or "raw"
 
 
 async def _scrape_card_rush(card_number: str, card_name: str = "") -> dict:
-    """Apify Cheerio Scraper + RESIDENTIAL proxy，bypass Cloudflare。"""
+    """
+    Apify Cheerio Scraper + RESIDENTIAL proxy，bypass Cloudflare。
+    FIX: URL 帶兩個 field：
+      - keyword  = カード名/商品名（卡名）
+      - keyword2 = 型番（卡號）
+    ⚠️  請先用 /debug/html?url=https://www.cardrush-pokemon.jp/product-list
+        確認 form field name（name 屬性），如唔係 keyword/keyword2 請更新。
+    """
     apify_token = os.environ.get("APIFY_API_TOKEN", "")
     if not apify_token:
         raise RuntimeError("APIFY_API_TOKEN not set")
 
-    # 取第一個 keyword 做 filter（通常係 Pokemon 名）
     name_filter = card_name.split()[0] if card_name else ""
 
-    q = quote(card_number, safe="")
+    q_name   = quote(card_name,   safe="")
+    q_number = quote(card_number, safe="")
+
+    # 分開兩個 field：商品名 + 型番
+    search_url = (
+        f"https://www.cardrush-pokemon.jp/product-list"
+        f"?keyword={q_name}&keyword2={q_number}&Submit=%E6%A4%9C%E7%B4%A2"
+    )
+
     page_func = f"""async function pageFunction(context) {{
         const {{ $ }} = context;
         const nameFilter = {json.dumps(name_filter)};
@@ -320,10 +366,9 @@ async def _scrape_card_rush(card_number: str, card_name: str = "") -> dict:
         }});
         return results;
     }}"""
+
     payload = {
-        "startUrls": [
-            {"url": f"https://www.cardrush-pokemon.jp/product-list?keyword={q}&Submit=%E6%A4%9C%E7%B4%A2"}
-        ],
+        "startUrls": [{"url": search_url}],
         "pageFunction": page_func,
         "proxyConfiguration": {
             "useApifyProxy": True,
@@ -340,7 +385,6 @@ async def _scrape_card_rush(card_number: str, card_name: str = "") -> dict:
         r.raise_for_status()
         items = r.json()
 
-    # dataset items 係 nested：[[{...}, ...]]
     raw = []
     for page_result in items:
         if isinstance(page_result, list):
@@ -390,7 +434,8 @@ async def _scrape_card_rush(card_number: str, card_name: str = "") -> dict:
     }
 
 
-# ── Scraper 4: Mercari TW ────────────────────────────────────────────────
+# ── Scraper 4: Mercari TW ─────────────────────────────────────────────────
+# FIX: search keyword 加入 rarity，避免出無關結果
 
 def _mercari_stats(prices: list[int]) -> dict:
     return {
@@ -402,7 +447,6 @@ def _mercari_stats(prices: list[int]) -> dict:
 
 
 async def _get_twd_hkd_rate() -> float:
-    """TWD → HKD 匯率（1 TWD = ? HKD），1hr cache"""
     cache_key = "TWD_HKD"
     if _rate_cache.get(cache_key + "_ts") and time.time() - _rate_cache[cache_key + "_ts"] < 3600:
         return _rate_cache[cache_key]
@@ -415,40 +459,40 @@ async def _get_twd_hkd_rate() -> float:
             _rate_cache[cache_key + "_ts"] = time.time()
             return rate
     except Exception:
-        return 0.24  # fallback
+        return 0.24
 
 
-async def _scrape_mercari_tw(card_number: str, card_name: str = "") -> dict:
+async def _scrape_mercari_tw(card_number: str, card_name: str = "", rarity: str = "") -> dict:
     """
     Playwright + stealth context，爬 Mercari TW。
-    用 DOM 直接提取價格（Mercari 已改 Next.js App Router，無 initialItems script tag）。
+    FIX: search keyword 包含 rarity，例如 "メガリザードンXex 110/080 SAR"，
+         避免出波鞋等完全無關嘅搜尋結果。
     返回在售 / 已售各自 min/max/avg (NTD + HKD)。
-    返回 {"status": "no_results"} 區分真正無貨。
     """
     page = await _stealth_context.new_page()
     try:
         await page.add_init_script(_CR_STEALTH_SCRIPT)
         await page.set_extra_http_headers({"Referer": "https://www.google.com.tw/"})
-        q = quote(f"{card_name} {card_number}".strip() if card_name else card_number)
+
+        # FIX: 組合完整搜尋字串，加入 rarity
+        keyword_parts = " ".join(filter(None, [card_name, card_number, rarity]))
+        q = quote(keyword_parts or card_number)
+
         await page.goto(
             f"https://tw.mercari.com/zh-hant/search?keyword={q}",
             wait_until="domcontentloaded",
             timeout=35000,
         )
-        # 等 React hydration 完成（items 渲染出嚟），networkidle 係最可靠嘅信號
         try:
             await page.wait_for_load_state("networkidle", timeout=20000)
         except Exception:
-            await page.wait_for_timeout(5000)  # fallback: 等多 5s
+            await page.wait_for_timeout(5000)
 
-        # body.innerText: Mercari 將 NT$ 同數字分成兩行（獨立 DOM 元素）
-        # 格式: "...NT$\n6,785\n..." 或 "...已售出\nNT$\n6,785\n..."
         items_data = await page.evaluate(r"""() => {
             const text = document.body.innerText || '';
             const lines = text.split('\n').map(l => l.trim()).filter(l => l);
             const results = [];
             for (let i = 0; i < lines.length; i++) {
-                // 偵測 NT$ 行（有時 NT$ 同數字在同一行，有時分開）
                 let price = 0;
                 if (lines[i] === 'NT$' && i + 1 < lines.length) {
                     const num = lines[i + 1].replace(/,/g, '');
@@ -458,8 +502,6 @@ async def _scrape_mercari_tw(card_number: str, card_name: str = "") -> dict:
                     if (m) price = parseInt(m[1].replace(/,/g, ''));
                 }
                 if (price < 50 || price > 50000000) continue;
-
-                // 往前 8 行內有無「已售出」
                 const ctx = lines.slice(Math.max(0, i - 8), i + 2).join(' ');
                 const isSold = ctx.includes('已售出') || ctx.includes('SOLD') || ctx.includes('Sold out');
                 results.push({ price, is_sold: isSold });
@@ -542,10 +584,11 @@ async def search(
 async def mercari_search(
     cardNumber: str = Query(..., example="288/SM-P"),
     cardName:   str = Query(default="", example="リザードンex"),
+    rarity:     str = Query(default="", example="SAR"),
 ):
     """Mercari TW 獨立查詢，返回在售/已售 min/max/avg（TWD + HKD）。"""
     try:
-        result = await _scrape_mercari_tw(cardNumber, cardName)
+        result = await _scrape_mercari_tw(cardNumber, cardName, rarity)
         status = result.get("status") if result else None
         if status == "no_results":
             return {"card_number": cardNumber, "message": "no results found"}
@@ -563,10 +606,11 @@ async def mercari_search(
 @app.get("/card-rush")
 async def card_rush_search(
     cardNumber: str = Query(..., example="288/SM-P"),
+    cardName:   str = Query(default="", example="リザードンex"),
 ):
     """Card Rush 獨立查詢，返回各 grade min/max/avg（含 HKD 換算）及在庫狀態。"""
     try:
-        rates, result = await asyncio.gather(_get_rates(), _scrape_card_rush(cardNumber))
+        rates, result = await asyncio.gather(_get_rates(), _scrape_card_rush(cardNumber, cardName))
         if not result:
             return {"card_number": cardNumber, "message": "no results found"}
         for stats in result.get("by_grade", {}).values():
@@ -589,10 +633,11 @@ async def card_rush_search(
 async def snkr_dunk_search(
     cardNumber: str = Query(..., example="288/SM-P"),
     cardName:   str = Query(default="", example="リザードンex"),
+    rarity:     str = Query(default="", example="SAR"),
 ):
     """SNKR Dunk 獨立查詢，返回 PSA8/PSA9/PSA10/raw 分組 min/max/avg（含 HKD 換算）。"""
     try:
-        rates, result = await asyncio.gather(_get_rates(), _scrape_snkr_dunk(cardNumber, cardName))
+        rates, result = await asyncio.gather(_get_rates(), _scrape_snkr_dunk(cardNumber, cardName, rarity))
         if not result:
             return {"card_number": cardNumber, "message": "no results found"}
         for grade, stats in result.get("by_grade", {}).items():
@@ -603,6 +648,26 @@ async def snkr_dunk_search(
         ov["min_hkd"] = _jpy_to_hkd(ov["min_jpy"], rates)
         ov["max_hkd"] = _jpy_to_hkd(ov["max_jpy"], rates)
         ov["avg_hkd"] = _jpy_to_hkd(ov["avg_jpy"], rates)
+        result["exchange_rates"] = rates
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── GET /yuyu-tei ─────────────────────────────────────────────────────────
+
+@app.get("/yuyu-tei")
+async def yuyu_tei_search(
+    cardNumber: str = Query(..., example="110/080"),
+    cardName:   str = Query(default="", example="メガリザードンXex"),
+    rarity:     str = Query(default="", example="SAR"),
+):
+    """遊々亭獨立查詢（/buy/ 市場售價），支援 rarity filter。"""
+    try:
+        rates, result = await asyncio.gather(_get_rates(), _scrape_yuyu_tei(cardNumber, cardName, rarity))
+        if not result:
+            return {"card_number": cardNumber, "message": "no results found"}
+        result["price_hkd"] = _jpy_to_hkd(result["price_jpy"], rates)
         result["exchange_rates"] = rates
         return result
     except Exception as e:
@@ -625,7 +690,6 @@ HKT = timezone(timedelta(hours=8))
 
 @app.post("/price-report")
 async def price_report(req: PriceReportRequest):
-    # 順序執行，避免並行開多個 Playwright page 導致 RAM 爆
     errors = {}
 
     async def _safe(coro, key, timeout=30):
@@ -636,10 +700,12 @@ async def price_report(req: PriceReportRequest):
             return {}
 
     rates = await _get_rates()
-    yuyu  = await _safe(_scrape_yuyu_tei(req.card_number, req.card_name), "yuyu_tei", timeout=35)
-    snkr  = await _safe(_scrape_snkr_dunk(req.card_number, req.card_name), "snkr_dunk", timeout=20)
-    rush  = await _safe(_scrape_card_rush(req.card_number, req.card_name), "card_rush", timeout=120)
-    merc  = await _safe(_scrape_mercari_tw(req.card_number, req.card_name), "mercari_tw", timeout=60)
+
+    # FIX: 全部 scraper 都傳入 rarity
+    yuyu  = await _safe(_scrape_yuyu_tei(req.card_number, req.card_name, req.rarity),        "yuyu_tei",  timeout=35)
+    snkr  = await _safe(_scrape_snkr_dunk(req.card_number, req.card_name, req.rarity),       "snkr_dunk", timeout=20)
+    rush  = await _safe(_scrape_card_rush(req.card_number, req.card_name),                   "card_rush", timeout=120)
+    merc  = await _safe(_scrape_mercari_tw(req.card_number, req.card_name, req.rarity),      "mercari_tw", timeout=60)
 
     # ── 組裝 sources ──
     def _yuyu_out(r):
@@ -648,7 +714,6 @@ async def price_report(req: PriceReportRequest):
 
     def _snkr_out(r):
         if not r.get("overall"): return None
-        # 加 HKD 換算到每個 grade
         by_grade_hkd = {}
         for grade, stats in r.get("by_grade", {}).items():
             by_grade_hkd[grade] = {
@@ -695,13 +760,13 @@ async def price_report(req: PriceReportRequest):
 
     def _merc_out(r):
         if not r.get("on_sale") and not r.get("sold"): return None
-        return r  # already has HKD inside
+        return r
 
     sources = {
-        "yuyu_tei":    _yuyu_out(yuyu),
-        "snkr_dunk":   _snkr_out(snkr),
-        "card_rush":   _rush_out(rush),
-        "mercari":     _merc_out(merc),
+        "yuyu_tei":      _yuyu_out(yuyu),
+        "snkr_dunk":     _snkr_out(snkr),
+        "card_rush":     _rush_out(rush),
+        "mercari":       _merc_out(merc),
         "pricecharting": None,  # TODO: 正式版加入
     }
 
@@ -761,8 +826,7 @@ def _fmt_tg(card_label, ts, sources, summary, req) -> str:
         f"時間：{ts.strftime('%m-%d %H:%M')} HKT",
     ]
 
-    # 建立價格表（HKD）
-    rows: list[tuple[str, int, int, int]] = []  # (來源, 低, 高, 均)
+    rows: list[tuple[str, int, int, int]] = []
 
     if sources.get("yuyu_tei"):
         h = sources["yuyu_tei"]["price_hkd"]
@@ -788,7 +852,7 @@ def _fmt_tg(card_label, ts, sources, summary, req) -> str:
             rows.append(("Mercari已售", ov["min_hkd"], ov["max_hkd"], ov["avg_hkd"]))
 
     if rows:
-        C = 12  # 來源欄顯示寬度
+        C = 12
         hdr = _rpad("來源", C) + _rpad("低", 6) + _rpad("高", 6) + "均(HKD)"
         sep = "─" * (C + 6 + 6 + 7)
         tbl = [hdr, sep] + [
@@ -799,7 +863,6 @@ def _fmt_tg(card_label, ts, sources, summary, req) -> str:
     else:
         lines += ["", "⚠️ 暫時無市場數據"]
 
-    # PSA 分級均價表（Card Rush / SNKR Dunk by_grade）
     psa_rows = []
     for src_name, src_key in [("Card Rush", "card_rush"), ("SNKR Dunk", "snkr_dunk")]:
         src = sources.get(src_key)
