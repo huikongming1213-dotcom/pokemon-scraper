@@ -8,6 +8,7 @@ import json
 import os
 import re
 import time
+import unicodedata
 from datetime import datetime, timezone, timedelta
 from urllib.parse import quote
 
@@ -96,7 +97,452 @@ def _normalize_grade(grade: str) -> str:
     m2 = re.match(r"BGS([\d.]+)", g)
     if m2:
         return f"BGS{m2.group(1)}"
-    return grade  # 保留原格式（状態B, raw 等）
+    raw_condition = re.match(r"(?:RAW|状態)?([ABCD])(?:ランク)?$", g)
+    if raw_condition:
+        return raw_condition.group(1)
+    if g in {"RAW", "UNGRADED", "未鑑定"}:
+        return "raw"
+    return grade  # 保留原格式（無法判斷嘅 grading 等）
+
+
+# ── Card identity / quote helpers ─────────────────────────────────────────
+
+_JP_NAME_MAP = {
+    "pikachu": "ピカチュウ",
+    "pikachu v": "ピカチュウV",
+    "charizard": "リザードン",
+    "charizard ex": "リザードンex",
+    "mew": "ミュウ",
+    "mewtwo": "ミュウツー",
+    "eevee": "イーブイ",
+    "umbreon": "ブラッキー",
+    "sylveon": "ニンフィア",
+    "rayquaza": "レックウザ",
+}
+
+
+def _compact_name_lookup(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", text or "").lower()
+    return re.sub(r"[^0-9a-z]", "", normalized)
+
+
+_JP_COMPACT_NAME_MAP = {_compact_name_lookup(name): jp_name for name, jp_name in _JP_NAME_MAP.items()}
+
+_SET_CODE_MAP = {
+    "amazing volt tackle": "S4",
+    "仰天のボルテッカー": "S4",
+}
+
+
+def _has_japanese(text: str) -> bool:
+    return bool(re.search(r"[\u3040-\u30ff\u3400-\u9fff]", text or ""))
+
+
+def _normalize_card_identity(req) -> dict:
+    card_name = (req.card_name or "").strip()
+    card_number = re.sub(r"\s+", "", (req.card_number or "").replace("／", "/").strip())
+    rarity = (req.rarity or "").strip().upper()
+    set_name = (req.set_name or "").strip()
+
+    lower_name = re.sub(r"\s+", " ", card_name.lower())
+    jp_name = (
+        card_name
+        if _has_japanese(card_name)
+        else _JP_NAME_MAP.get(lower_name, "") or _JP_COMPACT_NAME_MAP.get(_compact_name_lookup(card_name), "")
+    )
+    query_name = jp_name or card_name
+
+    set_code = ""
+    m = re.search(r"\b[Ss][A-Za-z0-9-]+\b", set_name)
+    if m:
+        set_code = m.group(0).upper()
+    elif set_name:
+        set_code = _SET_CODE_MAP.get(set_name.lower(), "")
+
+    requirements = _quote_requirements(req)
+
+    return {
+        "display_name": card_name,
+        "query_name": query_name,
+        "jp_name": jp_name,
+        "card_number": card_number,
+        "rarity": rarity,
+        "set_name": set_name,
+        "set_code": set_code,
+        "is_psa": requirements["grading_type"] == "psa",
+        "psa_grade": req.psa_grade,
+        "target_grade": requirements["label"],
+        "quote_requirements": requirements,
+        "query": " ".join(filter(None, [query_name, card_number, rarity])),
+    }
+
+
+def _median_int(values: list[int]) -> int:
+    ordered = sorted(values)
+    n = len(ordered)
+    mid = n // 2
+    if n % 2:
+        return ordered[mid]
+    return round((ordered[mid - 1] + ordered[mid]) / 2)
+
+
+def _quantile_int(values: list[int], q: float) -> int:
+    ordered = sorted(values)
+    if len(ordered) == 1:
+        return ordered[0]
+    pos = (len(ordered) - 1) * q
+    lo = int(pos)
+    hi = min(lo + 1, len(ordered) - 1)
+    frac = pos - lo
+    return round(ordered[lo] * (1 - frac) + ordered[hi] * frac)
+
+
+def _summary_confidence(values: list[int], exact_count: int, basis: str) -> str:
+    if not values:
+        return "manual"
+    if exact_count == 1:
+        return "low"
+    spread = max(values) / max(1, min(values))
+    if exact_count >= 3 and spread <= 2.0 and basis.startswith("sold") and len(values) >= 2:
+        return "high"
+    if exact_count >= 3 and spread <= 3.0:
+        return "medium"
+    return "low"
+
+
+def _clean_int(value) -> int | None:
+    try:
+        parsed = int(value)
+        return parsed if 1 <= parsed <= 10 else None
+    except (TypeError, ValueError):
+        return None
+
+
+def _raw_condition(value: str | None) -> str | None:
+    if not value:
+        return None
+    normalized = _normalize_grade(value)
+    return normalized if normalized in {"A", "B", "C", "D"} else None
+
+
+def _quote_requirements(req) -> dict:
+    intent = (getattr(req, "intent", "") or "").strip().lower()
+    if intent not in {"buy", "sell"}:
+        intent = "unknown"
+
+    grading_type = (getattr(req, "grading_type", "") or "").strip().lower()
+    if grading_type not in {"raw", "psa"}:
+        grading_type = "psa" if getattr(req, "is_psa", False) else "raw"
+
+    warnings = []
+    if grading_type == "psa":
+        exact_grade = _clean_int(getattr(req, "psa_grade", None))
+        min_grade = _clean_int(getattr(req, "min_psa_grade", None))
+        if intent == "buy" and min_grade:
+            grades = [f"PSA{grade}" for grade in range(min_grade, 11)]
+            label = f"PSA{min_grade}-PSA10"
+        elif exact_grade:
+            grades = [f"PSA{exact_grade}"]
+            label = grades[0]
+        else:
+            grades = []
+            label = "PSA（分數未提供）"
+            warnings.append("missing_psa_grade")
+        return {
+            "intent": intent,
+            "grading_type": "psa",
+            "eligible_grades": grades,
+            "label": label,
+            "is_broad": len(grades) > 1,
+            "warnings": warnings,
+        }
+
+    exact_condition = _raw_condition(getattr(req, "card_condition", None))
+    min_condition = _raw_condition(getattr(req, "min_acceptable_condition", None))
+    ordered = ["A", "B", "C", "D"]
+    if intent == "buy" and min_condition:
+        grades = ordered[:ordered.index(min_condition) + 1]
+        label = f"RAW {'/'.join(grades)}"
+    elif intent == "sell" and exact_condition:
+        grades = [exact_condition]
+        label = f"RAW {exact_condition}"
+    else:
+        grades = ["A", "B", "C"]
+        label = "RAW A-C（卡況未確認）"
+        warnings.append("missing_raw_condition")
+    return {
+        "intent": intent,
+        "grading_type": "raw",
+        "eligible_grades": grades,
+        "label": label,
+        "is_broad": len(grades) > 1,
+        "warnings": warnings,
+    }
+
+
+_NON_CARD_TERMS = (
+    "BOX", "ボックス", "パック", "スリーブ", "デッキ", "プレイマット",
+    "カードケース", "オリパ", "福袋", "フィギュア", "ぬいぐるみ",
+)
+
+
+_CARD_NAME_SUFFIXES = ("VMAX", "VSTAR", "VUNION", "GX", "EX", "ex", "LVX", "V")
+
+
+def _compact_card_name(text: str) -> str:
+    normalized = unicodedata.normalize("NFKC", text or "")
+    return re.sub(r"[^0-9A-Za-z\u3040-\u30ff\u3400-\u9fff]", "", normalized)
+
+
+def _split_card_name_suffix(card_name: str) -> tuple[str, str]:
+    normalized = unicodedata.normalize("NFKC", card_name or "").strip()
+    compact = _compact_card_name(card_name)
+    for suffix in _CARD_NAME_SUFFIXES:
+        if compact.endswith(suffix) and len(compact) > len(suffix):
+            # Calyrex 等英文寶可夢名本身以 "ex" 結尾；英文 ex/EX 卡後綴應有分隔。
+            if suffix in {"ex", "EX"}:
+                raw_prefix = normalized[:-len(suffix)]
+                if raw_prefix and raw_prefix[-1].isascii() and raw_prefix[-1].isalnum():
+                    continue
+            return compact[:-len(suffix)], suffix
+    return compact, ""
+
+
+def _card_name_matches(title: str, card_name: str) -> bool:
+    """卡名後綴係 identity：V、VMAX、VSTAR、ex、EX、GX 不可互相代替。"""
+    title_compact = _compact_card_name(title)
+    base, target_suffix = _split_card_name_suffix(card_name)
+    if not title_compact or not base:
+        return False
+
+    title_folded = title_compact.casefold()
+    base_folded = base.casefold()
+    start = 0
+    while True:
+        index = title_folded.find(base_folded, start)
+        if index < 0:
+            return False
+        tail = title_compact[index + len(base):]
+        if target_suffix:
+            if tail.startswith(target_suffix):
+                if target_suffix != "V" or not any(tail.startswith(longer) for longer in ("VMAX", "VSTAR", "VUNION")):
+                    return True
+        elif not any(tail.startswith(suffix) for suffix in _CARD_NAME_SUFFIXES):
+            return True
+        start = index + 1
+
+
+def _listing_match(title: str, identity: dict) -> dict:
+    text = (title or "").strip()
+    upper = text.upper()
+    reasons = []
+    score = 0
+
+    card_number = identity.get("card_number", "")
+    number_match = bool(card_number and card_number.upper() in upper)
+    if number_match:
+        score += 4
+        reasons.append("card_number")
+
+    # 單卡 title 有時會帶「拡張パック」作為系列名；卡號 exact match 時唔當商品包裝排除。
+    excluded_term = next((term for term in _NON_CARD_TERMS if term.upper() in upper), None)
+    if excluded_term and not number_match:
+        return {"score": 0, "eligible": False, "reasons": [f"non_card:{excluded_term}"]}
+
+    query_name = identity.get("query_name", "")
+    name_match = bool(query_name and _card_name_matches(text, query_name))
+    if name_match:
+        score += 2
+        reasons.append("card_name")
+
+    rarity = identity.get("rarity", "")
+    if rarity and re.search(rf"(?<![A-Z0-9]){re.escape(rarity)}(?![A-Z0-9])", upper):
+        score += 1
+        reasons.append("rarity")
+
+    set_code = identity.get("set_code", "")
+    set_match = bool(set_code and set_code.upper() in upper)
+    if set_match:
+        score += 1
+        reasons.append("set_code")
+
+    # 保守模式：完整卡名 + 卡號必須同中；已知系列碼時亦必須命中。
+    required_identity = number_match and (name_match or not query_name) and (set_match or not set_code)
+    eligible = required_identity if card_number else (name_match and score >= 3 and (set_match or not set_code))
+    if not eligible:
+        reasons.append("identity_not_exact")
+    return {"score": score, "eligible": eligible, "reasons": reasons}
+
+
+def _collect_price_points(sources: dict, req, identity: dict) -> list[dict]:
+    points = []
+    requirements = _quote_requirements(req)
+
+    if sources.get("yuyu_tei"):
+        points.append({
+            "source": "yuyu_tei",
+            "grade": "raw",
+            "raw_condition": None,
+            "status": "shop_price",
+            "metric": "single",
+            "price_hkd": sources["yuyu_tei"]["price_hkd"],
+            "count": 1,
+            "match_score": 7,
+            "match_reasons": ["dedicated_card_shop", "card_number"],
+            "quote_eligible": requirements["grading_type"] == "raw" and "missing_raw_condition" in requirements["warnings"],
+            "review_reason": "raw_condition_unknown",
+        })
+
+    for source_key in ("snkr_dunk", "card_rush", "magi"):
+        source = sources.get(source_key)
+        if not source:
+            continue
+        for listing in source.get("listings", []):
+            match = _listing_match(listing.get("name", ""), identity)
+            grade = _normalize_grade(listing.get("grade") or "raw")
+            condition = grade if grade in {"A", "B", "C", "D"} else None
+            raw_unknown_allowed = (
+                grade == "raw"
+                and requirements["grading_type"] == "raw"
+                and "missing_raw_condition" in requirements["warnings"]
+            )
+            eligible_grade = grade in requirements["eligible_grades"] or raw_unknown_allowed
+            points.append({
+                "source": source_key,
+                "grade": grade,
+                "raw_condition": condition,
+                "status": listing.get("status", "active"),
+                "metric": "listing",
+                "price_hkd": listing["price_hkd"],
+                "count": 1,
+                "name": listing.get("name", ""),
+                "match_score": match["score"],
+                "match_reasons": match["reasons"],
+                "quote_eligible": match["eligible"] and eligible_grade,
+                "review_reason": (
+                    None if match["eligible"] and eligible_grade
+                    else "raw_condition_unknown" if match["eligible"] and grade == "raw"
+                    else "identity_or_grade_mismatch"
+                ),
+            })
+        if not source.get("listings"):
+            for grade, stats in source.get("by_grade", {}).items():
+                points.append({
+                    "source": source_key,
+                    "grade": grade,
+                    "status": "active",
+                    "metric": "avg",
+                    "price_hkd": stats["avg_hkd"],
+                    "count": stats.get("count", 1),
+                    "match_score": 0,
+                    "match_reasons": ["aggregate_without_listing_identity"],
+                    "quote_eligible": False,
+                    "review_reason": "cannot_verify_listing_identity",
+                })
+
+    mercari = sources.get("mercari")
+    if mercari:
+        for grade, grade_data in mercari.get("by_grade", {}).items():
+            for status_key in ("sold", "on_sale"):
+                stats = grade_data.get(status_key)
+                if not stats:
+                    continue
+                points.append({
+                    "source": "mercari",
+                    "grade": grade,
+                    "status": "sold" if status_key == "sold" else "active",
+                    "metric": "avg",
+                    "price_hkd": stats["avg_hkd"],
+                    "count": stats.get("count", 1),
+                    "match_score": 0,
+                    "match_reasons": ["mercari_page_text_only"],
+                    "quote_eligible": False,
+                    "review_reason": "mercari_listing_identity_unverified",
+                })
+
+        if requirements["grading_type"] == "raw" and not mercari.get("by_grade"):
+            for status_key in ("sold", "on_sale"):
+                stats = mercari.get(status_key)
+                if stats:
+                    points.append({
+                        "source": "mercari",
+                        "grade": "raw",
+                        "status": "sold" if status_key == "sold" else "active",
+                        "metric": "avg",
+                        "price_hkd": stats["avg_hkd"],
+                        "count": stats.get("count", 1),
+                        "match_score": 0,
+                        "match_reasons": ["mercari_page_text_only"],
+                        "quote_eligible": False,
+                        "review_reason": "mercari_listing_identity_unverified",
+                    })
+
+    return points
+
+
+def _build_summary(price_points: list[dict], req) -> dict | None:
+    requirements = _quote_requirements(req)
+    target_grade = requirements["label"]
+    eligible = [p for p in price_points if p.get("quote_eligible") and p.get("price_hkd")]
+
+    if not eligible:
+        return {
+            "target_grade": target_grade,
+            "eligible_grades": requirements["eligible_grades"],
+            "confidence": "manual",
+            "reason": "no_verified_matching_data",
+            "price_point_count": 0,
+            "warnings": requirements["warnings"],
+        }
+
+    values = [p["price_hkd"] for p in eligible]
+    sold_values = [p["price_hkd"] for p in eligible if p["status"] == "sold"]
+    active_values = [p["price_hkd"] for p in eligible if p["status"] == "active"]
+    sample_count = sum(p.get("count", 1) for p in eligible)
+    source_count = len({p["source"] for p in eligible})
+
+    if len(sold_values) >= 2:
+        base = _median_int(sold_values)
+        basis = "sold_median"
+    elif sold_values and active_values:
+        base = _median_int(values)
+        basis = "verified_mixed_median"
+    elif sold_values:
+        base = sold_values[0]
+        basis = "single_sold"
+    elif len(active_values) >= 3:
+        base = _quantile_int(active_values, 0.25)
+        basis = "active_p25"
+    elif active_values:
+        base = _median_int(active_values)
+        basis = "active_median"
+    else:
+        base = _median_int(values)
+        basis = "exact_grade_median"
+
+    confidence = _summary_confidence(values, sample_count, basis)
+    if confidence == "high" and len(sold_values) < 2:
+        confidence = "medium"
+    if source_count < 2 or requirements["warnings"] or requirements["is_broad"]:
+        confidence = "low"
+
+    return {
+        "target_grade": target_grade,
+        "eligible_grades": requirements["eligible_grades"],
+        "basis": basis,
+        "market_base_hkd": base,
+        "hkd_low": min(values),
+        "hkd_high": max(values),
+        "recommended_buy": round(base * 0.9),
+        "recommended_sell": round(base * 1.05),
+        "confidence": confidence,
+        "price_point_count": len(eligible),
+        "sample_count": sample_count,
+        "source_count": source_count,
+        "sources_used": sorted({p["source"] for p in eligible}),
+        "warnings": requirements["warnings"],
+        "boss_review_required": True,
+    }
 
 
 # ── DEBUG endpoint (臨時用，睇真實 HTML 結構) ─────────────────────────────
@@ -256,8 +702,6 @@ async def _scrape_snkr_dunk(card_number: str, card_name: str = "", rarity: str =
     if not products:
         return {}
 
-    name_keywords = [k for k in card_name.split() if len(k) > 1] if card_name else []
-
     listings = [
         {
             "price_jpy": p["salePrice"],
@@ -267,14 +711,15 @@ async def _scrape_snkr_dunk(card_number: str, card_name: str = "", rarity: str =
         }
         for p in products
         if p.get("salePrice", 0) > 0
-        and (not name_keywords or any(kw in (p.get("title") or "") for kw in name_keywords))
+        and (not card_number or card_number in (p.get("title") or ""))
+        and (not card_name or _card_name_matches(p.get("title") or "", card_name))
     ]
 
     if not listings:
         return {}
 
     by_grade = {}
-    for grade_key in ("PSA10", "PSA9", "PSA8", "PSA8以下", "raw"):
+    for grade_key in sorted({listing["grade"] for listing in listings}):
         stats = _grade_stats(listings, grade_key)
         if stats:
             by_grade[grade_key] = stats
@@ -442,7 +887,80 @@ async def _scrape_card_rush(card_number: str, card_name: str = "") -> dict:
     }
 
 
-# ── Scraper 4: Mercari TW ─────────────────────────────────────────────────
+# ── Scraper 4: magi marketplace listings ─────────────────────────────────
+
+async def _scrape_magi(card_number: str, card_name: str = "", rarity: str = "") -> dict:
+    """magi Pokemon 在售 + 已售 listings；保留逐項 title / URL 供 identity filter。"""
+    page = await _stealth_context.new_page()
+    try:
+        # magi 多關鍵字係 OR search；rarity 會擴闊結果，所以只搜尋卡名 + 卡號，再逐項 AND filter。
+        keyword = " ".join(filter(None, [card_name, card_number]))
+        q = quote(keyword or card_number, safe="")
+        raw_items = []
+        for status_param, status in (("presented", "active"), ("sold_out", "sold")):
+            url = (
+                "https://magi.camp/items/search"
+                f"?forms_search_items%5Bkeyword%5D={q}"
+                "&forms_search_items%5Bgoods_id%5D=1"
+                f"&forms_search_items%5Bstatus%5D={status_param}"
+                "&forms_search_items%5Binclude_oripa%5D=false"
+            )
+            await page.goto(url, wait_until="domcontentloaded", timeout=35000)
+            try:
+                await page.wait_for_load_state("networkidle", timeout=10000)
+            except Exception:
+                await page.wait_for_timeout(1500)
+            status_items = await page.evaluate(r"""() => {
+                return Array.from(document.querySelectorAll('.item-list__box')).slice(0, 40).map(box => {
+                    const link = box.querySelector('a.item-list__link[href*="/items/"]');
+                    const name = box.querySelector('.item-list__item-name')?.textContent?.trim() || '';
+                    const priceText = box.querySelector('.item-list__price-box--price')?.textContent || '';
+                    const price = parseInt(priceText.replace(/[^0-9]/g, ''), 10) || 0;
+                    return { name, price_jpy: price, url: link?.href || '' };
+                }).filter(item => item.name && item.price_jpy > 0 && item.url);
+            }""")
+            raw_items.extend({**item, "status": status} for item in status_items)
+
+        listings = []
+        for item in raw_items:
+            title = item["name"]
+            if card_number and card_number not in title:
+                continue
+            if card_name and not _card_name_matches(title, card_name):
+                continue
+            psa = re.search(r"PSA\s*(\d+)", item["name"], re.IGNORECASE)
+            listings.append({
+                **item,
+                "grade": f"PSA{psa.group(1)}" if psa else "raw",
+            })
+
+        if not listings:
+            return {}
+
+        by_grade = {}
+        for grade in sorted({listing["grade"] for listing in listings}):
+            stats = _grade_stats(listings, grade)
+            if stats:
+                by_grade[grade] = stats
+
+        prices = [listing["price_jpy"] for listing in listings]
+        return {
+            "listing_count": len(listings),
+            "by_grade": by_grade,
+            "overall": {
+                "min_jpy": min(prices),
+                "max_jpy": max(prices),
+                "avg_jpy": round(sum(prices) / len(prices)),
+            },
+            "listings": listings,
+        }
+    except Exception as e:
+        raise RuntimeError(f"magi failed: {type(e).__name__}: {e}")
+    finally:
+        await page.close()
+
+
+# ── Scraper 5: Mercari TW ─────────────────────────────────────────────────
 # FIX: search keyword 加入 rarity，避免出無關結果
 
 def _mercari_stats(prices: list[int]) -> dict:
@@ -624,6 +1142,31 @@ async def search(
 
 # ── GET /mercari ──────────────────────────────────────────────────────────
 
+@app.get("/magi")
+async def magi_search(
+    cardNumber: str = Query(..., example="030/100"),
+    cardName:   str = Query(default="", example="ピカチュウV"),
+    rarity:     str = Query(default="", example="RR"),
+):
+    """magi 在售 + 已售單卡，返回逐項 title / URL / grade / JPY + HKD。"""
+    try:
+        rates, result = await asyncio.gather(_get_rates(), _scrape_magi(cardNumber, cardName, rarity))
+        if not result:
+            return {"card_number": cardNumber, "message": "no results found"}
+        for stats in result.get("by_grade", {}).values():
+            stats["min_hkd"] = _jpy_to_hkd(stats["min_jpy"], rates)
+            stats["max_hkd"] = _jpy_to_hkd(stats["max_jpy"], rates)
+            stats["avg_hkd"] = _jpy_to_hkd(stats["avg_jpy"], rates)
+        for listing in result.get("listings", []):
+            listing["price_hkd"] = _jpy_to_hkd(listing["price_jpy"], rates)
+        result["exchange_rates"] = rates
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
+# ── GET /mercari ──────────────────────────────────────────────────────────
+
 @app.get("/mercari")
 async def mercari_search(
     cardNumber: str = Query(..., example="288/SM-P"),
@@ -725,8 +1268,13 @@ class PriceReportRequest(BaseModel):
     card_number: str
     set_name:    str = ""
     rarity:      str = ""
+    intent:       str = ""
+    grading_type: str = ""
     is_psa:      bool = False
     psa_grade:   int | None = None
+    min_psa_grade: int | None = None
+    card_condition: str | None = None
+    min_acceptable_condition: str | None = None
 
 
 HKT = timezone(timedelta(hours=8))
@@ -743,20 +1291,34 @@ async def price_report(req: PriceReportRequest):
             errors[key] = str(e)
             return {}
 
+    identity = _normalize_card_identity(req)
     rates = await _get_rates()
 
-    # FIX: 全部 scraper 都傳入 rarity
-    yuyu  = await _safe(_scrape_yuyu_tei(req.card_number, req.card_name, req.rarity),        "yuyu_tei",  timeout=35)
-    snkr  = await _safe(_scrape_snkr_dunk(req.card_number, req.card_name, req.rarity),       "snkr_dunk", timeout=20)
-    rush  = await _safe(_scrape_card_rush(req.card_number, req.card_name),                   "card_rush", timeout=120)
-    merc  = await _safe(_scrape_mercari_tw(req.card_number, req.card_name, req.rarity),      "mercari_tw", timeout=60)
+    # FIX: 全部 scraper 都傳入 rarity；日站優先用 normalized 日文名查詢
+    query_name = identity["query_name"]
+    card_number = identity["card_number"]
+    rarity = identity["rarity"]
+    yuyu, snkr, rush, magi, merc = await asyncio.gather(
+        _safe(_scrape_yuyu_tei(card_number, query_name, rarity),   "yuyu_tei",  timeout=35),
+        _safe(_scrape_snkr_dunk(card_number, query_name, rarity),  "snkr_dunk", timeout=20),
+        _safe(_scrape_card_rush(card_number, query_name),          "card_rush", timeout=120),
+        _safe(_scrape_magi(card_number, query_name, rarity),       "magi",      timeout=40),
+        _safe(_scrape_mercari_tw(card_number, query_name, rarity), "mercari_tw", timeout=60),
+    )
 
     # ── 組裝 sources ──
     def _yuyu_out(r):
         if not r.get("price_jpy"): return None
-        return {"price_jpy": r["price_jpy"], "price_hkd": _jpy_to_hkd(r["price_jpy"], rates), "name": r.get("name"), "currency": "JPY"}
+        return {
+            "price_jpy": r["price_jpy"],
+            "price_hkd": _jpy_to_hkd(r["price_jpy"], rates),
+            "name": r.get("name"),
+            "currency": "JPY",
+            "grading_scope": "raw_only",
+            "trust": "verified_card_shop",
+        }
 
-    def _snkr_out(r):
+    def _jpy_listings_out(r):
         if not r.get("overall"): return None
         by_grade_hkd = {}
         for grade, stats in r.get("by_grade", {}).items():
@@ -767,6 +1329,14 @@ async def price_report(req: PriceReportRequest):
                 "avg_hkd": _jpy_to_hkd(stats["avg_jpy"], rates),
             }
         ov = r["overall"]
+        listings_hkd = [
+            {
+                **l,
+                "price_hkd": _jpy_to_hkd(l["price_jpy"], rates),
+                "currency": "JPY",
+            }
+            for l in r.get("listings", [])
+        ]
         return {
             "listing_count": r["listing_count"],
             "by_grade":      by_grade_hkd,
@@ -776,7 +1346,9 @@ async def price_report(req: PriceReportRequest):
                 "max_hkd": _jpy_to_hkd(ov["max_jpy"], rates),
                 "avg_hkd": _jpy_to_hkd(ov["avg_jpy"], rates),
             },
+            "listings": listings_hkd,
             "currency": "JPY",
+            "trust": "listing_identity_checked",
         }
 
     def _rush_out(r):
@@ -790,6 +1362,14 @@ async def price_report(req: PriceReportRequest):
                 "avg_hkd": _jpy_to_hkd(stats["avg_jpy"], rates),
             }
         ov = r["overall"]
+        listings_hkd = [
+            {
+                **l,
+                "price_hkd": _jpy_to_hkd(l["price_jpy"], rates),
+                "currency": "JPY",
+            }
+            for l in r.get("listings", [])
+        ]
         return {
             "listing_count": r["listing_count"],
             "by_grade":      by_grade_hkd,
@@ -799,63 +1379,49 @@ async def price_report(req: PriceReportRequest):
                 "max_hkd": _jpy_to_hkd(ov["max_jpy"], rates),
                 "avg_hkd": _jpy_to_hkd(ov["avg_jpy"], rates),
             },
+            "listings": listings_hkd,
             "currency": "JPY",
+            "trust": "listing_identity_checked",
         }
 
     def _merc_out(r):
         if not r.get("on_sale") and not r.get("sold"): return None
-        return r
+        return {
+            **r,
+            "trust": "reference_only",
+            "quote_eligible": False,
+            "warning": "listing title 未逐項核對，可能混入非目標卡或非卡商品",
+        }
 
     sources = {
         "yuyu_tei":      _yuyu_out(yuyu),
-        "snkr_dunk":     _snkr_out(snkr),
+        "snkr_dunk":     _jpy_listings_out(snkr),
         "card_rush":     _rush_out(rush),
+        "magi":          _jpy_listings_out(magi),
         "mercari":       _merc_out(merc),
         "pricecharting": None,  # TODO: 正式版加入
     }
 
-    # ── Summary ──
-    hkd_prices = []
-    if sources["yuyu_tei"]:
-        hkd_prices.append(sources["yuyu_tei"]["price_hkd"])
-    if sources["snkr_dunk"] and sources["snkr_dunk"].get("overall"):
-        hkd_prices.append(sources["snkr_dunk"]["overall"]["avg_hkd"])
-    if sources["card_rush"] and sources["card_rush"].get("overall"):
-        hkd_prices.append(sources["card_rush"]["overall"]["avg_hkd"])
-    if sources["mercari"]:
-        m = sources["mercari"]
-        if m.get("on_sale"):
-            hkd_prices.append(m["on_sale"]["avg_hkd"])
-        elif m.get("sold"):
-            hkd_prices.append(m["sold"]["avg_hkd"])
+    price_points = _collect_price_points(sources, req, identity)
+    summary = _build_summary(price_points, req)
 
-    summary = None
-    if hkd_prices:
-        low  = min(hkd_prices)
-        high = max(hkd_prices)
-        summary = {
-            "hkd_low":          low,
-            "hkd_high":         high,
-            "recommended_buy":  round(low  * 0.9),
-            "recommended_sell": round(high * 1.05),
-            "confidence":       "high" if len(hkd_prices) >= 2 else "low",
-        }
-
-    card_label = f"{req.card_name} {req.rarity} {req.card_number}".strip()
+    card_label = " ".join(filter(None, [query_name, rarity, card_number]))
     now_hkt    = datetime.now(HKT)
 
     return {
         "card_name":      card_label,
+        "identity":       identity,
         "timestamp":      now_hkt.isoformat(),
         "sources":        sources,
+        "price_points":   price_points,
         "summary":        summary,
         "exchange_rates": rates,
         "errors":         errors or None,
-        "tg_message":     _fmt_tg(card_label, now_hkt, sources, summary, req),
+        "tg_message":     _fmt_tg(card_label, now_hkt, sources, price_points, summary, req, errors),
     }
 
 
-def _fmt_tg(card_label, ts, sources, summary, req) -> str:
+def _fmt_tg(card_label, ts, sources, price_points, summary, req, errors) -> str:
     import unicodedata as _ud
 
     def _dw(s: str) -> int:
@@ -864,97 +1430,124 @@ def _fmt_tg(card_label, ts, sources, summary, req) -> str:
     def _rpad(s: str, w: int) -> str:
         return s + ' ' * max(0, w - _dw(s))
 
+    requirements = _quote_requirements(req)
+    intent_label = {"buy": "客人想買", "sell": "客人想賣"}.get(requirements["intent"], "買賣方向未確認")
     lines = [
-        "🔔 <b>報價審批</b>",
-        f"卡名：<b>{card_label}</b>",
-        f"時間：{ts.strftime('%m-%d %H:%M')} HKT",
+        "🔎 <b>市場價格快照（老細覆核）</b>",
+        f"卡：<b>{card_label}</b>",
+        f"需求：{intent_label}｜{requirements['label']}",
+        f"更新：{ts.strftime('%m-%d %H:%M')} HKT",
     ]
 
+    source_labels = {
+        "yuyu_tei": "遊々亭",
+        "snkr_dunk": "SNKR",
+        "card_rush": "Card Rush",
+        "magi": "magi",
+    }
+    grouped: dict[tuple[str, str], list[int]] = {}
+    for point in price_points:
+        if not point.get("quote_eligible") or not point.get("price_hkd"):
+            continue
+        grade = point.get("grade", "raw")
+        grouped.setdefault((point["source"], grade), []).append(point["price_hkd"])
+
     rows: list[tuple[str, int, int, int]] = []
-
-    if sources.get("yuyu_tei"):
-        h = sources["yuyu_tei"]["price_hkd"]
-        rows.append(("遊々亭", h, h, h))
-
-    if sources.get("snkr_dunk"):
-        ov = sources["snkr_dunk"].get("overall", {})
-        if ov:
-            rows.append(("SNKR Dunk", ov["min_hkd"], ov["max_hkd"], ov["avg_hkd"]))
-
-    if sources.get("card_rush"):
-        ov = sources["card_rush"].get("overall", {})
-        if ov:
-            rows.append(("Card Rush", ov["min_hkd"], ov["max_hkd"], ov["avg_hkd"]))
-
-    if sources.get("mercari"):
-        m = sources["mercari"]
-        if m.get("on_sale"):
-            ov = m["on_sale"]
-            rows.append(("Mercari在售", ov["min_hkd"], ov["max_hkd"], ov["avg_hkd"]))
-        if m.get("sold"):
-            ov = m["sold"]
-            rows.append(("Mercari已售", ov["min_hkd"], ov["max_hkd"], ov["avg_hkd"]))
+    for (source, grade), values in sorted(grouped.items()):
+        grade_label = "RAW" if grade == "raw" else grade
+        rows.append((f"{source_labels.get(source, source)} {grade_label}", min(values), max(values), _median_int(values)))
 
     if rows:
         C = 12
-        hdr = _rpad("來源", C) + _rpad("低", 8) + _rpad("高", 8) + "均(HKD)"
+        hdr = _rpad("來源", C) + _rpad("低", 8) + _rpad("高", 8) + "中位(HKD)"
         sep = "─" * (C + 8 + 8 + 7)
         tbl = [hdr, sep] + [
             _rpad(n, C) + _rpad(str(lo), 8) + _rpad(str(hi), 8) + str(avg)
             for n, lo, hi, avg in rows
         ]
-        lines += ["", "<pre>" + "\n".join(tbl) + "</pre>"]
+        lines += ["", "✅ 已核對、符合條件", "<pre>" + "\n".join(tbl) + "</pre>"]
     else:
-        lines += ["", "⚠️ 暫時無市場數據"]
+        lines += ["", "⚠️ 暫時冇已核對、符合條件嘅市場樣本"]
 
-    psa_rows = []
-
-    # Card Rush + SNKR Dunk：JPY sources，by_grade 直接有 avg_hkd
-    for src_name, src_key in [("Card Rush", "card_rush"), ("SNKR Dunk", "snkr_dunk")]:
-        src = sources.get(src_key)
-        if not src or not src.get("by_grade"):
-            continue
-        bg = src["by_grade"]
-        p8  = bg.get("PSA8",  {}).get("avg_hkd")
-        p9  = bg.get("PSA9",  {}).get("avg_hkd")
-        p10 = bg.get("PSA10", {}).get("avg_hkd")
-        if p8 or p9 or p10:
-            psa_rows.append((src_name, p8, p9, p10))
-
-    # Mercari TW：by_grade 每個 grade 有 on_sale / sold，優先用 on_sale avg_hkd
-    merc_src = sources.get("mercari")
-    if merc_src and merc_src.get("by_grade"):
-        def _merc_grade_hkd(grade_data: dict) -> int | None:
-            s = grade_data.get("on_sale") or grade_data.get("sold")
-            return s.get("avg_hkd") if s else None
-        bg = merc_src["by_grade"]
-        p8  = _merc_grade_hkd(bg.get("PSA8",  {}))
-        p9  = _merc_grade_hkd(bg.get("PSA9",  {}))
-        p10 = _merc_grade_hkd(bg.get("PSA10", {}))
-        if p8 or p9 or p10:
-            psa_rows.append(("Mercari TW", p8, p9, p10))
-
-    if psa_rows:
-        C2 = 12
-        hdr2 = _rpad("來源", C2) + _rpad("PSA8", 6) + _rpad("PSA9", 6) + "PSA10"
-        sep2 = "─" * (C2 + 6 + 6 + 5)
-        tbl2 = [hdr2, sep2] + [
-            _rpad(n, C2)
-            + _rpad(str(p8)  if p8  else "—", 6)
-            + _rpad(str(p9)  if p9  else "—", 6)
-            + (str(p10) if p10 else "—")
-            for n, p8, p9, p10 in psa_rows
+    raw_reference: dict[str, list[int]] = {}
+    if requirements["grading_type"] == "raw":
+        for point in price_points:
+            if (
+                not point.get("quote_eligible")
+                and point.get("grade") == "raw"
+                and point.get("match_score", 0) >= 4
+                and point.get("price_hkd")
+                and point.get("source") in {"yuyu_tei", "magi"}
+            ):
+                raw_reference.setdefault(point["source"], []).append(point["price_hkd"])
+    if raw_reference:
+        ref_lines = [
+            f"{source_labels.get(source, source)} RAW：HK${min(values):,}-HK${max(values):,}"
+            for source, values in sorted(raw_reference.items())
         ]
-        lines += ["", "🏅 PSA 分級均價（HKD）", "<pre>" + "\n".join(tbl2) + "</pre>"]
+        lines += ["", "ℹ️ 卡況未標示（唔納入 A/B/C/D 基準）", *ref_lines]
 
-    if req.is_psa and req.psa_grade:
-        lines.append(f"🏅 PSA {req.psa_grade}")
+    possible_reference: dict[tuple[str, str], list[int]] = {}
+    for point in price_points:
+        if (
+            not point.get("quote_eligible")
+            and point.get("source") != "mercari"
+            and point.get("match_score", 0) >= 6
+            and point.get("grade") in requirements["eligible_grades"]
+            and point.get("price_hkd")
+        ):
+            key = (point["source"], point.get("grade", "raw"))
+            possible_reference.setdefault(key, []).append(point["price_hkd"])
+    if possible_reference:
+        possible_lines = [
+            f"{source_labels.get(source, source)} {grade}：HK${min(values):,}-HK${max(values):,}"
+            for (source, grade), values in sorted(possible_reference.items())
+        ]
+        lines += ["", "ℹ️ 卡名/卡號中，但系列未確認或不符（不入基準）", *possible_lines]
 
-    if summary:
+    mercari = sources.get("mercari")
+    if mercari:
+        ref_rows = []
+        for grade in requirements["eligible_grades"]:
+            grade_data = mercari.get("by_grade", {}).get(grade, {})
+            for status, label in (("sold", "已售"), ("on_sale", "在售")):
+                stats = grade_data.get(status)
+                if stats:
+                    ref_rows.append((f"Mercari {label} {grade}", stats["min_hkd"], stats["max_hkd"], stats["avg_hkd"]))
+        if requirements["grading_type"] == "raw" and not ref_rows:
+            for status, label in (("sold", "已售"), ("on_sale", "在售")):
+                stats = mercari.get(status)
+                if stats:
+                    ref_rows.append((f"Mercari {label}", stats["min_hkd"], stats["max_hkd"], stats["avg_hkd"]))
+        if ref_rows:
+            C2 = 18
+            hdr2 = _rpad("來源", C2) + _rpad("低", 8) + _rpad("高", 8) + "均(HKD)"
+            tbl2 = [hdr2, "─" * (C2 + 8 + 8 + 7)] + [
+                _rpad(n, C2) + _rpad(str(lo), 8) + _rpad(str(hi), 8) + str(avg)
+                for n, lo, hi, avg in ref_rows
+            ]
+            lines += ["", "⚠️ 僅供核對（Mercari 未能逐項驗證商品）", "<pre>" + "\n".join(tbl2) + "</pre>"]
+
+    rejected_count = sum(1 for p in price_points if not p.get("quote_eligible"))
+    if rejected_count:
+        lines.append(f"🧹 已隔離 {rejected_count} 個不符條件／未能核對樣本")
+
+    if summary and summary.get("recommended_buy") is not None:
+        icon = {"high": "🟢", "medium": "🟡", "low": "🟠"}.get(summary.get("confidence"), "⚪")
         lines += [
             "",
-            f"💰 建議買入：<b>HK${summary['recommended_buy']:,}</b>　建議賣出：<b>HK${summary['recommended_sell']:,}</b>",
-            f"信心度：{'🟢' if summary['confidence'] == 'high' else '🟡'} {summary['confidence'].upper()}",
+            f"📊 市場基準：<b>HK${summary.get('market_base_hkd', 0):,}</b>（{summary.get('basis', 'n/a')}）",
+            f"試算買入：HK${summary['recommended_buy']:,}｜試算賣出：HK${summary['recommended_sell']:,}",
+            f"來源：{summary.get('source_count', 0)} 個網站｜信心度：{icon} {summary['confidence'].upper()}",
+            "⚠️ 試算只供老細參考，最終由老細手動報價俾客。",
         ]
+    elif summary and summary.get("confidence") == "manual":
+        lines += ["", f"⚠️ 未搵到 {summary.get('target_grade', requirements['label'])} 嘅已核對樣本，需要人手逐網覆核。"]
+
+    if requirements["warnings"]:
+        lines.append("⚠️ 客人資料未完整，今次只可當寬鬆市場參考。")
+    if errors:
+        failed = "、".join(sorted(errors))
+        lines.append(f"❌ 未能取得：{failed}")
 
     return "\n".join(lines)
