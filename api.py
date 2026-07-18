@@ -393,7 +393,7 @@ def _collect_price_points(sources: dict, req, identity: dict) -> list[dict]:
             "review_reason": "raw_condition_unknown",
         })
 
-    for source_key in ("snkr_dunk", "card_rush", "magi"):
+    for source_key in ("snkr_dunk", "card_rush", "magi", "yahoo_auctions"):
         source = sources.get(source_key)
         if not source:
             continue
@@ -960,7 +960,100 @@ async def _scrape_magi(card_number: str, card_name: str = "", rarity: str = "") 
         await page.close()
 
 
-# ── Scraper 5: Mercari TW ─────────────────────────────────────────────────
+# ── Scraper 5: Yahoo Auctions Japan ───────────────────────────────────────
+
+async def _scrape_yahoo_auctions(card_number: str, card_name: str = "", rarity: str = "") -> dict:
+    """
+    Yahoo!オークション 在售搜尋頁。
+    先用 search result page 補 PSA active listing 樣本，避免逐 item detail 增加不穩定性。
+    """
+    page = await _stealth_context.new_page()
+    try:
+        keyword_parts = " ".join(filter(None, [card_name, card_number, rarity]))
+        q = quote(keyword_parts or card_number, safe="")
+        await page.goto(
+            f"https://auctions.yahoo.co.jp/search/search?p={q}&auccat=0",
+            wait_until="domcontentloaded",
+            timeout=35000,
+        )
+        try:
+            await page.wait_for_load_state("networkidle", timeout=12000)
+        except Exception:
+            await page.wait_for_timeout(2000)
+
+        raw_items = await page.evaluate(r"""() => {
+            const seen = new Set();
+            const rows = [];
+            for (const link of Array.from(document.querySelectorAll('a[href*="/jp/auction/"][data-auction-price]'))) {
+                const href = link.href || '';
+                if (!href || seen.has(href)) continue;
+                seen.add(href);
+
+                const priceText = link.getAttribute('data-auction-price') || '';
+                const price = parseInt(String(priceText).replace(/[^0-9]/g, ''), 10) || 0;
+                if (price <= 0) continue;
+
+                const title =
+                    link.querySelector('img[alt]')?.getAttribute('alt')?.trim() ||
+                    link.getAttribute('aria-label')?.trim() ||
+                    link.textContent?.trim() ||
+                    '';
+                if (!title) continue;
+
+                rows.push({
+                    url: href,
+                    name: title,
+                    price_jpy: price,
+                    is_flea: Boolean(link.getAttribute('data-auction-isflea')),
+                    is_free_shipping: Boolean(link.getAttribute('data-auction-isfreeshipping')),
+                });
+                if (rows.length >= 40) break;
+            }
+            return rows;
+        }""")
+
+        listings = []
+        for item in raw_items:
+            title = item.get("name", "")
+            if card_number and card_number.upper() not in title.upper():
+                continue
+            if card_name and not _card_name_matches(title, card_name):
+                continue
+            psa = re.search(r"PSA\s*(\d+)", title, re.IGNORECASE)
+            listings.append({
+                **item,
+                "grade": f"PSA{psa.group(1)}" if psa else "raw",
+                "status": "active",
+                "marketplace": "auction",
+            })
+
+        if not listings:
+            return {}
+
+        by_grade = {}
+        for grade in sorted({listing["grade"] for listing in listings}):
+            stats = _grade_stats(listings, grade)
+            if stats:
+                by_grade[grade] = stats
+
+        prices = [listing["price_jpy"] for listing in listings]
+        return {
+            "listing_count": len(listings),
+            "by_grade": by_grade,
+            "overall": {
+                "min_jpy": min(prices),
+                "max_jpy": max(prices),
+                "avg_jpy": round(sum(prices) / len(prices)),
+            },
+            "listings": listings,
+        }
+    except Exception as e:
+        raise RuntimeError(f"yahoo_auctions failed: {type(e).__name__}: {e}")
+    finally:
+        await page.close()
+
+
+# ── Scraper 6: Mercari TW ─────────────────────────────────────────────────
 # FIX: search keyword 加入 rarity，避免出無關結果
 
 def _mercari_stats(prices: list[int]) -> dict:
@@ -1214,6 +1307,41 @@ async def card_rush_search(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ── GET /yahoo-auctions ────────────────────────────────────────────────────
+
+@app.get("/yahoo-auctions")
+async def yahoo_auctions_search(
+    cardNumber: str = Query(..., example="030/100"),
+    cardName:   str = Query(default="", example="ピカチュウV"),
+    rarity:     str = Query(default="", example="RR"),
+):
+    """Yahoo!オークション獨立查詢，返回 active listings 分級統計（含 HKD 換算）。"""
+    try:
+        rates, result = await asyncio.gather(_get_rates(), _scrape_yahoo_auctions(cardNumber, cardName, rarity))
+        if not result:
+            return {"card_number": cardNumber, "message": "no results found"}
+        for stats in result.get("by_grade", {}).values():
+            stats["min_hkd"] = _jpy_to_hkd(stats["min_jpy"], rates)
+            stats["max_hkd"] = _jpy_to_hkd(stats["max_jpy"], rates)
+            stats["avg_hkd"] = _jpy_to_hkd(stats["avg_jpy"], rates)
+        ov = result["overall"]
+        ov["min_hkd"] = _jpy_to_hkd(ov["min_jpy"], rates)
+        ov["max_hkd"] = _jpy_to_hkd(ov["max_jpy"], rates)
+        ov["avg_hkd"] = _jpy_to_hkd(ov["avg_jpy"], rates)
+        result["listings"] = [
+            {
+                **listing,
+                "price_hkd": _jpy_to_hkd(listing["price_jpy"], rates),
+                "currency": "JPY",
+            }
+            for listing in result.get("listings", [])
+        ]
+        result["exchange_rates"] = rates
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ── GET /snkr-dunk ────────────────────────────────────────────────────────
 
 @app.get("/snkr-dunk")
@@ -1298,11 +1426,12 @@ async def price_report(req: PriceReportRequest):
     query_name = identity["query_name"]
     card_number = identity["card_number"]
     rarity = identity["rarity"]
-    yuyu, snkr, rush, magi, merc = await asyncio.gather(
+    yuyu, snkr, rush, magi, yahoo, merc = await asyncio.gather(
         _safe(_scrape_yuyu_tei(card_number, query_name, rarity),   "yuyu_tei",  timeout=35),
         _safe(_scrape_snkr_dunk(card_number, query_name, rarity),  "snkr_dunk", timeout=20),
         _safe(_scrape_card_rush(card_number, query_name),          "card_rush", timeout=120),
         _safe(_scrape_magi(card_number, query_name, rarity),       "magi",      timeout=40),
+        _safe(_scrape_yahoo_auctions(card_number, query_name, rarity), "yahoo_auctions", timeout=40),
         _safe(_scrape_mercari_tw(card_number, query_name, rarity), "mercari_tw", timeout=60),
     )
 
@@ -1398,6 +1527,7 @@ async def price_report(req: PriceReportRequest):
         "snkr_dunk":     _jpy_listings_out(snkr),
         "card_rush":     _rush_out(rush),
         "magi":          _jpy_listings_out(magi),
+        "yahoo_auctions": _jpy_listings_out(yahoo),
         "mercari":       _merc_out(merc),
         "pricecharting": None,  # TODO: 正式版加入
     }
@@ -1444,6 +1574,7 @@ def _fmt_tg(card_label, ts, sources, price_points, summary, req, errors) -> str:
         "snkr_dunk": "SNKR",
         "card_rush": "Card Rush",
         "magi": "magi",
+        "yahoo_auctions": "Yahoo Auc",
     }
     grouped: dict[tuple[str, str], list[int]] = {}
     for point in price_points:
