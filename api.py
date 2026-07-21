@@ -81,6 +81,16 @@ def _jpy_to_hkd(jpy: int, rates: dict) -> int:
     return round(jpy * rates["JPY_HKD"])
 
 
+def _usd_to_jpy(usd_amount: float, rates: dict) -> int:
+    jpy_per_usd = rates["USD_HKD"] / max(rates["JPY_HKD"], 0.000001)
+    return round(usd_amount * jpy_per_usd)
+
+
+def _usd_to_twd(usd_amount: float, twd_hkd_rate: float, rates: dict) -> int:
+    twd_per_usd = rates["USD_HKD"] / max(twd_hkd_rate, 0.000001)
+    return round(usd_amount * twd_per_usd)
+
+
 # ── Grade normalization ────────────────────────────────────────────────────
 
 def _normalize_grade(grade: str) -> str:
@@ -298,6 +308,13 @@ def _compact_card_name(text: str) -> str:
 def _strip_html(text: str) -> str:
     plain = re.sub(r"<[^>]+>", " ", text or "")
     return re.sub(r"\s+", " ", unescape(plain)).strip()
+
+
+def _clean_marketplace_title(text: str) -> str:
+    cleaned = (text or "").strip()
+    cleaned = re.sub(r"\s+のサムネイル$", "", cleaned)
+    cleaned = re.sub(r"\s+thumbnail$", "", cleaned, flags=re.IGNORECASE)
+    return cleaned.strip()
 
 
 def _split_card_name_suffix(card_name: str) -> tuple[str, str]:
@@ -1096,14 +1113,12 @@ async def _scrape_mercari_marketplace(
 
         payload = await page.evaluate(r"""(config) => {
             const soldTokens = (config.soldTokens || []).map(token => token.toLowerCase());
-            const pricePattern = config.currency === 'TWD'
-                ? /NT\$\s*([\d,]+)/ig
-                : /(?:[¥￥]\s*([\d,]+)|([\d,]+)\s*円)/ig;
             const noisePatterns = [
                 /^NT\$\s*[\d,]+$/i,
-                /^[¥￥]\s*[\d,]+$/i,
-                /^[\d,]+\s*円$/i,
-                /^(SOLD|Sold out|已售出|売り切れ)$/i,
+                /^US\$\s*[\d,.]+$/i,
+                /^[\u00A5\uFFE5]\s*[\d,]+$/i,
+                /^[\d,]+\s*\u5186$/i,
+                /^(SOLD|Sold out|\u5df2\u552e\u51fa|\u58f2\u308a\u5207\u308c)$/i,
             ];
             const blockedText = (document.body.innerText || '').toLowerCase();
             if (
@@ -1132,15 +1147,40 @@ async def _scrape_mercari_marketplace(
                 if (!text) continue;
 
                 const prices = [];
-                let match;
-                while ((match = pricePattern.exec(text)) !== null) {
-                    const raw = (match[1] || match[2] || '').replace(/,/g, '');
-                    if (/^\d+$/.test(raw)) prices.push(parseInt(raw, 10));
+                const addPrice = (kind, raw) => {
+                    if (!raw) return;
+                    const normalized = String(raw).replace(/,/g, '').trim();
+                    if (!normalized) return;
+                    if (kind === 'USD') {
+                        const parsed = parseFloat(normalized);
+                        if (!Number.isNaN(parsed) && parsed > 0) prices.push({ kind, value: parsed });
+                        return;
+                    }
+                    if (/^\d+$/.test(normalized)) {
+                        const parsed = parseInt(normalized, 10);
+                        if (parsed > 0) prices.push({ kind, value: parsed });
+                    }
+                };
+
+                const linesForPrice = text.split(/\n+/).map(line => line.replace(/\s+/g, ' ').trim()).filter(Boolean);
+                for (let i = 0; i < linesForPrice.length; i++) {
+                    const line = linesForPrice[i];
+                    const next = linesForPrice[i + 1] || '';
+                    const twInline = line.match(/NT\$\s*([\d,]+)/i);
+                    if (twInline) addPrice('TWD', twInline[1]);
+                    const jpInline = line.match(/[\u00A5\uFFE5]\s*([\d,]+)/i) || line.match(/([\d,]+)\s*\u5186/i);
+                    if (jpInline) addPrice('JPY', jpInline[1]);
+                    const usdInline = line.match(/US\$\s*([\d,.]+)/i);
+                    if (usdInline) addPrice('USD', usdInline[1]);
+                    if (/^US\$$/i.test(line) && next) addPrice('USD', next);
+                    if (/^NT\$$/i.test(line) && next) addPrice('TWD', next);
+                    if (/^[\u00A5\uFFE5]$/.test(line) && next) addPrice('JPY', next);
+                    if (/^\u5186$/.test(line) && next) addPrice('JPY', next);
                     if (prices.length >= 3) break;
                 }
-                pricePattern.lastIndex = 0;
-                const price = prices[0] || 0;
-                if (price < 50 || price > 50000000) continue;
+
+                const chosenPrice = prices[0] || null;
+                if (!chosenPrice) continue;
 
                 const lowerText = text.toLowerCase();
                 const isSold = soldTokens.some(token => lowerText.includes(token));
@@ -1151,13 +1191,14 @@ async def _scrape_mercari_marketplace(
                     .map(line => line.replace(/\s+/g, ' ').trim())
                     .filter(line => line)
                     .filter(line => !noisePatterns.some(pattern => pattern.test(line)));
-                const title = imgAlt || aria || lines[0] || '';
+                const title = (imgAlt || aria || lines[0] || '').replace(/\s+\u306e\u30b5\u30e0\u30cd\u30a4\u30eb$/, '').trim();
                 if (!title) continue;
 
                 items.push({
                     url: abs,
                     name: title,
-                    price,
+                    price: chosenPrice.value,
+                    price_currency: chosenPrice.kind,
                     is_sold: isSold,
                 });
                 if (items.length >= 40) break;
@@ -1171,13 +1212,28 @@ async def _scrape_mercari_marketplace(
 
         raw_items = payload.get("items", [])
         listings = []
+        rates = None
+        twd_hkd_rate = None
         for item in raw_items:
-            title = item.get("name", "")
+            title = _clean_marketplace_title(item.get("name", ""))
             if card_number and card_number.upper() not in title.upper():
                 continue
             if card_name and not _card_name_matches(title, card_name):
                 continue
             psa_match = re.search(r"PSA\s*(\d+)", title, re.IGNORECASE)
+            raw_price = item.get("price")
+            price_currency = item.get("price_currency", currency)
+            if raw_price in (None, ""):
+                continue
+            if price_currency == "USD":
+                rates = rates or await _get_rates()
+                if currency == "JPY":
+                    normalized_price = _usd_to_jpy(float(raw_price), rates)
+                else:
+                    twd_hkd_rate = twd_hkd_rate or await _get_twd_hkd_rate()
+                    normalized_price = _usd_to_twd(float(raw_price), twd_hkd_rate, rates)
+            else:
+                normalized_price = int(round(float(raw_price)))
             listing = {
                 "name": title,
                 "url": item.get("url", ""),
@@ -1185,9 +1241,9 @@ async def _scrape_mercari_marketplace(
                 "status": "sold" if item.get("is_sold") else "active",
             }
             if currency == "TWD":
-                listing["price_twd"] = int(item["price"])
+                listing["price_twd"] = normalized_price
             else:
-                listing["price_jpy"] = int(item["price"])
+                listing["price_jpy"] = normalized_price
             listings.append(listing)
 
         if not listings:
