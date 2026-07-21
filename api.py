@@ -4,6 +4,7 @@ Pokemon Card Price Scraper
 """
 from contextlib import asynccontextmanager
 import asyncio
+from html import unescape
 import json
 import os
 import re
@@ -294,6 +295,11 @@ def _compact_card_name(text: str) -> str:
     return re.sub(r"[^0-9A-Za-z\u3040-\u30ff\u3400-\u9fff]", "", normalized)
 
 
+def _strip_html(text: str) -> str:
+    plain = re.sub(r"<[^>]+>", " ", text or "")
+    return re.sub(r"\s+", " ", unescape(plain)).strip()
+
+
 def _split_card_name_suffix(card_name: str) -> tuple[str, str]:
     normalized = unicodedata.normalize("NFKC", card_name or "").strip()
     compact = _compact_card_name(card_name)
@@ -393,7 +399,7 @@ def _collect_price_points(sources: dict, req, identity: dict) -> list[dict]:
             "review_reason": "raw_condition_unknown",
         })
 
-    for source_key in ("snkr_dunk", "card_rush", "magi", "yahoo_auctions"):
+    for source_key in ("snkr_dunk", "card_rush", "magi", "yahoo_auctions", "mercari_jp", "mercari_tw"):
         source = sources.get(source_key)
         if not source:
             continue
@@ -439,43 +445,6 @@ def _collect_price_points(sources: dict, req, identity: dict) -> list[dict]:
                     "quote_eligible": False,
                     "review_reason": "cannot_verify_listing_identity",
                 })
-
-    mercari = sources.get("mercari")
-    if mercari:
-        for grade, grade_data in mercari.get("by_grade", {}).items():
-            for status_key in ("sold", "on_sale"):
-                stats = grade_data.get(status_key)
-                if not stats:
-                    continue
-                points.append({
-                    "source": "mercari",
-                    "grade": grade,
-                    "status": "sold" if status_key == "sold" else "active",
-                    "metric": "avg",
-                    "price_hkd": stats["avg_hkd"],
-                    "count": stats.get("count", 1),
-                    "match_score": 0,
-                    "match_reasons": ["mercari_page_text_only"],
-                    "quote_eligible": False,
-                    "review_reason": "mercari_listing_identity_unverified",
-                })
-
-        if requirements["grading_type"] == "raw" and not mercari.get("by_grade"):
-            for status_key in ("sold", "on_sale"):
-                stats = mercari.get(status_key)
-                if stats:
-                    points.append({
-                        "source": "mercari",
-                        "grade": "raw",
-                        "status": "sold" if status_key == "sold" else "active",
-                        "metric": "avg",
-                        "price_hkd": stats["avg_hkd"],
-                        "count": stats.get("count", 1),
-                        "match_score": 0,
-                        "match_reasons": ["mercari_page_text_only"],
-                        "quote_eligible": False,
-                        "review_reason": "mercari_listing_identity_unverified",
-                    })
 
     return points
 
@@ -965,52 +934,60 @@ async def _scrape_magi(card_number: str, card_name: str = "", rarity: str = "") 
 async def _scrape_yahoo_auctions(card_number: str, card_name: str = "", rarity: str = "") -> dict:
     """
     Yahoo!オークション 在售搜尋頁。
-    先用 search result page 補 PSA active listing 樣本，避免逐 item detail 增加不穩定性。
+    改用 httpx 直接抓 search HTML，避免 Zeabur Playwright timeout。
     """
-    page = await _stealth_context.new_page()
     try:
         keyword_parts = " ".join(filter(None, [card_name, card_number, rarity]))
         q = quote(keyword_parts or card_number, safe="")
-        await page.goto(
-            f"https://auctions.yahoo.co.jp/search/search?p={q}&auccat=0",
-            wait_until="domcontentloaded",
-            timeout=35000,
-        )
-        try:
-            await page.wait_for_load_state("networkidle", timeout=12000)
-        except Exception:
-            await page.wait_for_timeout(2000)
+        url = f"https://auctions.yahoo.co.jp/search/search?p={q}&auccat=0"
+        headers = {
+            "User-Agent": _STEALTH_UA,
+            "Accept-Language": "ja-JP,ja;q=0.9,en;q=0.8",
+            "Referer": "https://auctions.yahoo.co.jp/",
+        }
+        async with httpx.AsyncClient(timeout=20, headers=headers, follow_redirects=True) as client:
+            response = await client.get(url)
+        if response.status_code not in {200, 404}:
+            raise RuntimeError(f"http_{response.status_code}")
 
-        raw_items = await page.evaluate(r"""() => {
-            const seen = new Set();
-            const rows = [];
-            for (const link of Array.from(document.querySelectorAll('a[href*="/jp/auction/"][data-auction-price]'))) {
-                const href = link.href || '';
-                if (!href || seen.has(href)) continue;
-                seen.add(href);
+        html = response.text
+        raw_items = []
+        seen_urls = set()
+        for match in re.finditer(r"<a\b([^>]*href=\"([^\"]*/jp/auction/[^\"]+)\"[^>]*)>(.*?)</a>", html, re.IGNORECASE | re.DOTALL):
+            attrs, href, body = match.groups()
+            price_match = re.search(r'data-auction-price="([^"]+)"', attrs)
+            if not price_match:
+                continue
+            digits = re.sub(r"[^\d]", "", price_match.group(1))
+            if not digits:
+                continue
+            absolute_url = href if href.startswith("http") else f"https://auctions.yahoo.co.jp{href}"
+            if absolute_url in seen_urls:
+                continue
+            seen_urls.add(absolute_url)
 
-                const priceText = link.getAttribute('data-auction-price') || '';
-                const price = parseInt(String(priceText).replace(/[^0-9]/g, ''), 10) || 0;
-                if (price <= 0) continue;
+            title = ""
+            for candidate in (
+                re.search(r'alt="([^"]+)"', body, re.IGNORECASE),
+                re.search(r'aria-label="([^"]+)"', attrs, re.IGNORECASE),
+            ):
+                if candidate:
+                    title = unescape(candidate.group(1)).strip()
+                    break
+            if not title:
+                title = _strip_html(body)
+            if not title:
+                continue
 
-                const title =
-                    link.querySelector('img[alt]')?.getAttribute('alt')?.trim() ||
-                    link.getAttribute('aria-label')?.trim() ||
-                    link.textContent?.trim() ||
-                    '';
-                if (!title) continue;
-
-                rows.push({
-                    url: href,
-                    name: title,
-                    price_jpy: price,
-                    is_flea: Boolean(link.getAttribute('data-auction-isflea')),
-                    is_free_shipping: Boolean(link.getAttribute('data-auction-isfreeshipping')),
-                });
-                if (rows.length >= 40) break;
-            }
-            return rows;
-        }""")
+            raw_items.append({
+                "url": absolute_url,
+                "name": title,
+                "price_jpy": int(digits),
+                "is_flea": 'data-auction-isflea="' in attrs.lower(),
+                "is_free_shipping": 'data-auction-isfreeshipping="' in attrs.lower(),
+            })
+            if len(raw_items) >= 40:
+                break
 
         listings = []
         for item in raw_items:
@@ -1049,20 +1026,9 @@ async def _scrape_yahoo_auctions(card_number: str, card_name: str = "", rarity: 
         }
     except Exception as e:
         raise RuntimeError(f"yahoo_auctions failed: {type(e).__name__}: {e}")
-    finally:
-        await page.close()
 
 
-# ── Scraper 6: Mercari TW ─────────────────────────────────────────────────
-# FIX: search keyword 加入 rarity，避免出無關結果
-
-def _mercari_stats(prices: list[int]) -> dict:
-    return {
-        "count":   len(prices),
-        "min_twd": min(prices),
-        "max_twd": max(prices),
-        "avg_twd": round(sum(prices) / len(prices)),
-    }
+# ── Scraper 6: Mercari JP / TW ────────────────────────────────────────────
 
 
 async def _get_twd_hkd_rate() -> float:
@@ -1081,117 +1047,208 @@ async def _get_twd_hkd_rate() -> float:
         return 0.24
 
 
-def _mercari_grade_stats(listings: list[dict], grade: str, sold: bool) -> dict | None:
-    """Mercari 用 TWD，計算某 grade + 在售/已售 嘅 min/max/avg"""
-    items = [l["price"] for l in listings if l["grade"] == grade and l["is_sold"] == sold]
-    if not items:
-        return None
+def _priced_stats(prices: list[int], prefix: str) -> dict:
     return {
-        "count":   len(items),
-        "min_twd": min(items),
-        "max_twd": max(items),
-        "avg_twd": round(sum(items) / len(items)),
+        "count": len(prices),
+        f"min_{prefix}": min(prices),
+        f"max_{prefix}": max(prices),
+        f"avg_{prefix}": round(sum(prices) / len(prices)),
     }
 
 
-async def _scrape_mercari_tw(card_number: str, card_name: str = "", rarity: str = "") -> dict:
-    """
-    Playwright + stealth context，爬 Mercari TW。
-    - search keyword 包含 rarity 過濾無關商品
-    - JS 從每個 listing 附近文字提取 PSA grade
-    - 返回在售/已售 overall + by_grade 分組（TWD + HKD）
-    """
+def _grouped_market_stats(listings: list[dict], *, price_key: str, prefix: str) -> tuple[dict, dict]:
+    by_grade = {}
+    for grade in sorted({listing["grade"] for listing in listings}):
+        grade_items = [listing[price_key] for listing in listings if listing["grade"] == grade]
+        if grade_items:
+            by_grade[grade] = _priced_stats(grade_items, prefix)
+    overall_prices = [listing[price_key] for listing in listings]
+    overall = _priced_stats(overall_prices, prefix)
+    return by_grade, overall
+
+
+async def _scrape_mercari_marketplace(
+    *,
+    base_url: str,
+    currency: str,
+    card_number: str,
+    card_name: str = "",
+    rarity: str = "",
+    referer: str,
+    sold_tokens: list[str],
+) -> dict:
     page = await _stealth_context.new_page()
     try:
         await page.add_init_script(_CR_STEALTH_SCRIPT)
-        await page.set_extra_http_headers({"Referer": "https://www.google.com.tw/"})
+        await page.set_extra_http_headers({"Referer": referer})
 
         keyword_parts = " ".join(filter(None, [card_name, card_number, rarity]))
-        q = quote(keyword_parts or card_number)
+        q = quote(keyword_parts or card_number, safe="")
 
         await page.goto(
-            f"https://tw.mercari.com/zh-hant/search?keyword={q}",
+            base_url.format(query=q),
             wait_until="domcontentloaded",
-            timeout=35000,
+            timeout=25000,
         )
-        try:
-            await page.wait_for_load_state("networkidle", timeout=20000)
-        except Exception:
-            await page.wait_for_timeout(5000)
+        await page.wait_for_timeout(2200)
+        await page.mouse.wheel(0, 1400)
+        await page.wait_for_timeout(1200)
 
-        items_data = await page.evaluate(r"""() => {
-            const text = document.body.innerText || '';
-            const lines = text.split('\n').map(l => l.trim()).filter(l => l);
-            const results = [];
-            for (let i = 0; i < lines.length; i++) {
-                let price = 0;
-                if (lines[i] === 'NT$' && i + 1 < lines.length) {
-                    const num = lines[i + 1].replace(/,/g, '');
-                    if (/^\d+$/.test(num)) { price = parseInt(num); i++; }
-                } else {
-                    const m = lines[i].match(/^NT\$\s*([\d,]+)$/);
-                    if (m) price = parseInt(m[1].replace(/,/g, ''));
+        payload = await page.evaluate(r"""(config) => {
+            const soldTokens = (config.soldTokens || []).map(token => token.toLowerCase());
+            const pricePattern = config.currency === 'TWD'
+                ? /NT\$\s*([\d,]+)/ig
+                : /(?:[¥￥]\s*([\d,]+)|([\d,]+)\s*円)/ig;
+            const noisePatterns = [
+                /^NT\$\s*[\d,]+$/i,
+                /^[¥￥]\s*[\d,]+$/i,
+                /^[\d,]+\s*円$/i,
+                /^(SOLD|Sold out|已售出|売り切れ)$/i,
+            ];
+            const blockedText = (document.body.innerText || '').toLowerCase();
+            if (
+                blockedText.includes('access denied') ||
+                blockedText.includes('unusual traffic') ||
+                blockedText.includes('captcha') ||
+                blockedText.includes('verify you are human')
+            ) {
+                return { status: 'blocked', reason: 'challenge_page' };
+            }
+
+            const items = [];
+            const seen = new Set();
+            for (const link of Array.from(document.querySelectorAll('a[href*="/item/"]'))) {
+                const href = link.getAttribute('href') || '';
+                const abs = href ? new URL(href, location.origin).href : '';
+                if (!abs || seen.has(abs)) continue;
+                seen.add(abs);
+
+                let container = link;
+                for (let i = 0; i < 4 && container.parentElement; i++) {
+                    container = container.parentElement;
                 }
+
+                const text = (container.innerText || link.innerText || '').replace(/\u00a0/g, ' ').trim();
+                if (!text) continue;
+
+                const prices = [];
+                let match;
+                while ((match = pricePattern.exec(text)) !== null) {
+                    const raw = (match[1] || match[2] || '').replace(/,/g, '');
+                    if (/^\d+$/.test(raw)) prices.push(parseInt(raw, 10));
+                    if (prices.length >= 3) break;
+                }
+                pricePattern.lastIndex = 0;
+                const price = prices[0] || 0;
                 if (price < 50 || price > 50000000) continue;
 
-                // 往前後各 10 行搵 sold 狀態 + PSA grade
-                const ctx = lines.slice(Math.max(0, i - 10), i + 3).join(' ');
-                const isSold = ctx.includes('已售出') || ctx.includes('SOLD') || ctx.includes('Sold out');
+                const lowerText = text.toLowerCase();
+                const isSold = soldTokens.some(token => lowerText.includes(token));
+                const imgAlt = link.querySelector('img[alt]')?.getAttribute('alt')?.trim() || '';
+                const aria = link.getAttribute('aria-label')?.trim() || '';
+                const lines = text
+                    .split(/\n+/)
+                    .map(line => line.replace(/\s+/g, ' ').trim())
+                    .filter(line => line)
+                    .filter(line => !noisePatterns.some(pattern => pattern.test(line)));
+                const title = imgAlt || aria || lines[0] || '';
+                if (!title) continue;
 
-                // 提取 PSA grade：優先抓 PSA + 數字，否則 raw
-                const psaMatch = ctx.match(/PSA\s*(\d+)/i);
-                const grade = psaMatch ? ('PSA' + psaMatch[1]) : 'raw';
-
-                results.push({ price, is_sold: isSold, grade });
+                items.push({
+                    url: abs,
+                    name: title,
+                    price,
+                    is_sold: isSold,
+                });
+                if (items.length >= 40) break;
             }
-            // 推薦排序頭 20 個 listing 已足夠，避免低質/無關結果污染統計
-            return results.slice(0, 20);
-        }""")
 
-        if not items_data:
+            return { status: 'ok', items };
+        }""", {"currency": currency, "soldTokens": sold_tokens})
+
+        if payload.get("status") == "blocked":
+            return payload
+
+        raw_items = payload.get("items", [])
+        listings = []
+        for item in raw_items:
+            title = item.get("name", "")
+            if card_number and card_number.upper() not in title.upper():
+                continue
+            if card_name and not _card_name_matches(title, card_name):
+                continue
+            psa_match = re.search(r"PSA\s*(\d+)", title, re.IGNORECASE)
+            listing = {
+                "name": title,
+                "url": item.get("url", ""),
+                "grade": f"PSA{psa_match.group(1)}" if psa_match else "raw",
+                "status": "sold" if item.get("is_sold") else "active",
+            }
+            if currency == "TWD":
+                listing["price_twd"] = int(item["price"])
+            else:
+                listing["price_jpy"] = int(item["price"])
+            listings.append(listing)
+
+        if not listings:
             return {"status": "no_results"}
 
-        twd_rate = await _get_twd_hkd_rate()
-
-        def _with_hkd(stats: dict) -> dict:
+        if currency == "TWD":
+            by_grade, overall = _grouped_market_stats(listings, price_key="price_twd", prefix="twd")
             return {
-                **stats,
-                "min_hkd": round(stats["min_twd"] * twd_rate),
-                "max_hkd": round(stats["max_twd"] * twd_rate),
-                "avg_hkd": round(stats["avg_twd"] * twd_rate),
+                "status": "ok",
+                "currency": "TWD",
+                "listing_count": len(listings),
+                "by_grade": by_grade,
+                "overall": overall,
+                "listings": listings,
             }
 
-        on_sale_prices = [d["price"] for d in items_data if not d["is_sold"]]
-        sold_prices    = [d["price"] for d in items_data if     d["is_sold"]]
-
-        if not on_sale_prices and not sold_prices:
-            return {"status": "no_results"}
-
-        # ── by_grade 分組：每個 grade 分別統計在售/已售 ──
-        all_grades = sorted({d["grade"] for d in items_data})
-        by_grade = {}
-        for g in all_grades:
-            on_s = _mercari_grade_stats(items_data, g, sold=False)
-            so   = _mercari_grade_stats(items_data, g, sold=True)
-            if on_s or so:
-                by_grade[g] = {
-                    "on_sale": _with_hkd(on_s) if on_s else None,
-                    "sold":    _with_hkd(so)   if so   else None,
-                }
-
+        by_grade, overall = _grouped_market_stats(listings, price_key="price_jpy", prefix="jpy")
         return {
-            "status":       "ok",
-            "currency":     "TWD",
-            "twd_hkd_rate": twd_rate,
-            "on_sale":      _with_hkd(_mercari_stats(on_sale_prices)) if on_sale_prices else None,
-            "sold":         _with_hkd(_mercari_stats(sold_prices))    if sold_prices    else None,
-            "by_grade":     by_grade,
+            "status": "ok",
+            "currency": "JPY",
+            "listing_count": len(listings),
+            "by_grade": by_grade,
+            "overall": overall,
+            "listings": listings,
         }
 
     except Exception as e:
-        raise RuntimeError(f"mercari_tw failed: {type(e).__name__}: {e}")
+        marketplace = "mercari_tw" if currency == "TWD" else "mercari_jp"
+        raise RuntimeError(f"{marketplace} failed: {type(e).__name__}: {e}")
     finally:
         await page.close()
+
+
+async def _scrape_mercari_tw(card_number: str, card_name: str = "", rarity: str = "") -> dict:
+    result = await _scrape_mercari_marketplace(
+        base_url="https://tw.mercari.com/zh-hant/search?keyword={query}",
+        currency="TWD",
+        card_number=card_number,
+        card_name=card_name,
+        rarity=rarity,
+        referer="https://www.google.com.tw/",
+        sold_tokens=["已售出", "sold", "sold out"],
+    )
+    if result.get("status") != "ok":
+        return result
+
+    twd_rate = await _get_twd_hkd_rate()
+    result["twd_hkd_rate"] = twd_rate
+    return result
+
+
+async def _scrape_mercari_jp(card_number: str, card_name: str = "", rarity: str = "") -> dict:
+    return await _scrape_mercari_marketplace(
+        base_url="https://jp.mercari.com/search?keyword={query}",
+        currency="JPY",
+        card_number=card_number,
+        card_name=card_name,
+        rarity=rarity,
+        referer="https://www.google.co.jp/",
+        sold_tokens=["売り切れ", "sold", "sold out"],
+    )
 
 
 # ── GET /search  (原有 endpoint，保留唔改) ────────────────────────────────
@@ -1265,9 +1322,35 @@ async def mercari_search(
     cardNumber: str = Query(..., example="288/SM-P"),
     cardName:   str = Query(default="", example="リザードンex"),
     rarity:     str = Query(default="", example="SAR"),
+    market:     str = Query(default="tw", example="tw"),
 ):
-    """Mercari TW 獨立查詢，返回在售/已售 min/max/avg（TWD + HKD）。"""
+    """Mercari 獨立查詢；預設 TW，可用 market=jp 切日本站。"""
     try:
+        selected = (market or "tw").strip().lower()
+        if selected == "jp":
+            rates, result = await asyncio.gather(_get_rates(), _scrape_mercari_jp(cardNumber, cardName, rarity))
+            status = result.get("status") if result else None
+            if status == "no_results":
+                return {"card_number": cardNumber, "message": "no results found"}
+            if status == "blocked":
+                return {"card_number": cardNumber, "message": "scraper blocked", "reason": result.get("reason")}
+            if not result:
+                return {"card_number": cardNumber, "message": "no results found"}
+            for stats in result.get("by_grade", {}).values():
+                stats["min_hkd"] = _jpy_to_hkd(stats["min_jpy"], rates)
+                stats["max_hkd"] = _jpy_to_hkd(stats["max_jpy"], rates)
+                stats["avg_hkd"] = _jpy_to_hkd(stats["avg_jpy"], rates)
+            overall = result["overall"]
+            overall["min_hkd"] = _jpy_to_hkd(overall["min_jpy"], rates)
+            overall["max_hkd"] = _jpy_to_hkd(overall["max_jpy"], rates)
+            overall["avg_hkd"] = _jpy_to_hkd(overall["avg_jpy"], rates)
+            result["listings"] = [
+                {**listing, "price_hkd": _jpy_to_hkd(listing["price_jpy"], rates), "currency": "JPY"}
+                for listing in result.get("listings", [])
+            ]
+            result["exchange_rates"] = rates
+            return result
+
         result = await _scrape_mercari_tw(cardNumber, cardName, rarity)
         status = result.get("status") if result else None
         if status == "no_results":
@@ -1276,6 +1359,19 @@ async def mercari_search(
             return {"card_number": cardNumber, "message": "scraper blocked", "reason": result.get("reason")}
         if not result:
             return {"card_number": cardNumber, "message": "no results found"}
+        twd_rate = result.get("twd_hkd_rate", 0.24)
+        for stats in result.get("by_grade", {}).values():
+            stats["min_hkd"] = round(stats["min_twd"] * twd_rate)
+            stats["max_hkd"] = round(stats["max_twd"] * twd_rate)
+            stats["avg_hkd"] = round(stats["avg_twd"] * twd_rate)
+        overall = result["overall"]
+        overall["min_hkd"] = round(overall["min_twd"] * twd_rate)
+        overall["max_hkd"] = round(overall["max_twd"] * twd_rate)
+        overall["avg_hkd"] = round(overall["avg_twd"] * twd_rate)
+        result["listings"] = [
+            {**listing, "price_hkd": round(listing["price_twd"] * twd_rate), "currency": "TWD"}
+            for listing in result.get("listings", [])
+        ]
         return result
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
@@ -1416,7 +1512,7 @@ async def price_report(req: PriceReportRequest):
         try:
             return await asyncio.wait_for(coro, timeout=timeout) or {}
         except Exception as e:
-            errors[key] = str(e)
+            errors[key] = str(e) or type(e).__name__
             return {}
 
     identity = _normalize_card_identity(req)
@@ -1426,13 +1522,14 @@ async def price_report(req: PriceReportRequest):
     query_name = identity["query_name"]
     card_number = identity["card_number"]
     rarity = identity["rarity"]
-    yuyu, snkr, rush, magi, yahoo, merc = await asyncio.gather(
+    yuyu, snkr, rush, magi, yahoo, merc_jp, merc_tw = await asyncio.gather(
         _safe(_scrape_yuyu_tei(card_number, query_name, rarity),   "yuyu_tei",  timeout=35),
         _safe(_scrape_snkr_dunk(card_number, query_name, rarity),  "snkr_dunk", timeout=20),
         _safe(_scrape_card_rush(card_number, query_name),          "card_rush", timeout=120),
         _safe(_scrape_magi(card_number, query_name, rarity),       "magi",      timeout=40),
         _safe(_scrape_yahoo_auctions(card_number, query_name, rarity), "yahoo_auctions", timeout=40),
-        _safe(_scrape_mercari_tw(card_number, query_name, rarity), "mercari_tw", timeout=60),
+        _safe(_scrape_mercari_jp(card_number, query_name, rarity), "mercari_jp", timeout=45),
+        _safe(_scrape_mercari_tw(card_number, query_name, rarity), "mercari_tw", timeout=45),
     )
 
     # ── 組裝 sources ──
@@ -1513,13 +1610,38 @@ async def price_report(req: PriceReportRequest):
             "trust": "listing_identity_checked",
         }
 
-    def _merc_out(r):
-        if not r.get("on_sale") and not r.get("sold"): return None
+    def _twd_listings_out(r):
+        if not r.get("overall"): return None
+        twd_rate = r.get("twd_hkd_rate", 0.24)
+        by_grade_hkd = {}
+        for grade, stats in r.get("by_grade", {}).items():
+            by_grade_hkd[grade] = {
+                **stats,
+                "min_hkd": round(stats["min_twd"] * twd_rate),
+                "max_hkd": round(stats["max_twd"] * twd_rate),
+                "avg_hkd": round(stats["avg_twd"] * twd_rate),
+            }
+        ov = r["overall"]
+        listings_hkd = [
+            {
+                **l,
+                "price_hkd": round(l["price_twd"] * twd_rate),
+                "currency": "TWD",
+            }
+            for l in r.get("listings", [])
+        ]
         return {
-            **r,
-            "trust": "reference_only",
-            "quote_eligible": False,
-            "warning": "listing title 未逐項核對，可能混入非目標卡或非卡商品",
+            "listing_count": r["listing_count"],
+            "by_grade": by_grade_hkd,
+            "overall": {
+                **ov,
+                "min_hkd": round(ov["min_twd"] * twd_rate),
+                "max_hkd": round(ov["max_twd"] * twd_rate),
+                "avg_hkd": round(ov["avg_twd"] * twd_rate),
+            },
+            "listings": listings_hkd,
+            "currency": "TWD",
+            "trust": "listing_identity_checked",
         }
 
     sources = {
@@ -1528,7 +1650,9 @@ async def price_report(req: PriceReportRequest):
         "card_rush":     _rush_out(rush),
         "magi":          _jpy_listings_out(magi),
         "yahoo_auctions": _jpy_listings_out(yahoo),
-        "mercari":       _merc_out(merc),
+        "mercari_jp":    _jpy_listings_out(merc_jp),
+        "mercari_tw":    _twd_listings_out(merc_tw),
+        "mercari":       _twd_listings_out(merc_tw),
         "pricecharting": None,  # TODO: 正式版加入
     }
 
@@ -1575,6 +1699,8 @@ def _fmt_tg(card_label, ts, sources, price_points, summary, req, errors) -> str:
         "card_rush": "Card Rush",
         "magi": "magi",
         "yahoo_auctions": "Yahoo Auc",
+        "mercari_jp": "Mercari JP",
+        "mercari_tw": "Mercari TW",
     }
     grouped: dict[tuple[str, str], list[int]] = {}
     for point in price_points:
@@ -1622,7 +1748,6 @@ def _fmt_tg(card_label, ts, sources, price_points, summary, req, errors) -> str:
     for point in price_points:
         if (
             not point.get("quote_eligible")
-            and point.get("source") != "mercari"
             and point.get("match_score", 0) >= 6
             and point.get("grade") in requirements["eligible_grades"]
             and point.get("price_hkd")
@@ -1635,29 +1760,6 @@ def _fmt_tg(card_label, ts, sources, price_points, summary, req, errors) -> str:
             for (source, grade), values in sorted(possible_reference.items())
         ]
         lines += ["", "ℹ️ 卡名/卡號中，但系列未確認或不符（不入基準）", *possible_lines]
-
-    mercari = sources.get("mercari")
-    if mercari:
-        ref_rows = []
-        for grade in requirements["eligible_grades"]:
-            grade_data = mercari.get("by_grade", {}).get(grade, {})
-            for status, label in (("sold", "已售"), ("on_sale", "在售")):
-                stats = grade_data.get(status)
-                if stats:
-                    ref_rows.append((f"Mercari {label} {grade}", stats["min_hkd"], stats["max_hkd"], stats["avg_hkd"]))
-        if requirements["grading_type"] == "raw" and not ref_rows:
-            for status, label in (("sold", "已售"), ("on_sale", "在售")):
-                stats = mercari.get(status)
-                if stats:
-                    ref_rows.append((f"Mercari {label}", stats["min_hkd"], stats["max_hkd"], stats["avg_hkd"]))
-        if ref_rows:
-            C2 = 18
-            hdr2 = _rpad("來源", C2) + _rpad("低", 8) + _rpad("高", 8) + "均(HKD)"
-            tbl2 = [hdr2, "─" * (C2 + 8 + 8 + 7)] + [
-                _rpad(n, C2) + _rpad(str(lo), 8) + _rpad(str(hi), 8) + str(avg)
-                for n, lo, hi, avg in ref_rows
-            ]
-            lines += ["", "⚠️ 僅供核對（Mercari 未能逐項驗證商品）", "<pre>" + "\n".join(tbl2) + "</pre>"]
 
     rejected_count = sum(1 for p in price_points if not p.get("quote_eligible"))
     if rejected_count:
