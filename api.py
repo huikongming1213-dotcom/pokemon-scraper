@@ -149,6 +149,53 @@ def _has_japanese(text: str) -> bool:
     return bool(re.search(r"[\u3040-\u30ff\u3400-\u9fff]", text or ""))
 
 
+_ONE_PIECE_GAMES = {"one_piece_card_game", "onepiece", "one_piece"}
+
+
+def _normalized_game(value: str | None) -> str:
+    game = (value or "pokemon_tcg").strip().lower()
+    return game or "pokemon_tcg"
+
+
+def _is_one_piece_game(value: str | None) -> bool:
+    return _normalized_game(value) in _ONE_PIECE_GAMES
+
+
+def _search_keyword(card_number: str, card_name: str = "", rarity: str = "", game: str = "pokemon_tcg") -> str:
+    if _is_one_piece_game(game):
+        parts = ["ワンピースカード", card_name.strip(), card_number.strip()]
+    else:
+        parts = [card_name.strip(), card_number.strip(), rarity.strip()]
+    return " ".join(part for part in parts if part)
+
+
+def _normalize_set_code(text: str) -> str:
+    compact = re.sub(r"[^A-Z0-9]", "", (text or "").upper())
+    return compact
+
+
+def _op_bigweb_rarity_match(listing_rarity: str, target_rarity: str) -> bool:
+    target = (target_rarity or "").strip().upper()
+    label = unicodedata.normalize("NFKC", listing_rarity or "").upper()
+    if not target:
+        return True
+    if target == "SEC":
+        return ("シークレット" in label or "SEC" in label) and "/P" not in label and "SP" not in label
+    if target == "SR":
+        return ("スーパーレア" in label or re.search(r"\bSR\b", label)) and "/P" not in label and "SP" not in label
+    if target == "R":
+        return ("レア" in label or re.search(r"\bR\b", label)) and "/P" not in label and "SR" not in label and "SP" not in label
+    if target == "L":
+        return "リーダー" in label or re.search(r"\bL\b", label)
+    if target == "C":
+        return "コモン" in label or re.search(r"\bC\b", label)
+    if target == "UC":
+        return "アンコモン" in label or "UC" in label
+    if target == "P":
+        return label.endswith("P") or "/P" in label or "プロモ" in label
+    return target in label
+
+
 def _normalize_card_identity(req) -> dict:
     card_name = (req.card_name or "").strip()
     card_number = re.sub(r"\s+", "", (req.card_number or "").replace("／", "/").strip())
@@ -164,13 +211,18 @@ def _normalize_card_identity(req) -> dict:
     query_name = jp_name or card_name
 
     set_code = ""
-    m = re.search(r"\b[Ss][A-Za-z0-9-]+\b", set_name)
-    if m:
-        set_code = m.group(0).upper()
-    elif set_name:
+    compact_number = _normalize_set_code(card_number)
+    compact_set_name = _normalize_set_code(set_name)
+    for candidate in (compact_set_name, compact_number):
+        m = re.match(r"(S[PV]\d+|S\d+|SM\d+|SV\d+|OP\d+|ST\d+|EB\d+|PRB\d+|P\d+)", candidate)
+        if m:
+            set_code = m.group(1)
+            break
+    if not set_code and set_name:
         set_code = _SET_CODE_MAP.get(set_name.lower(), "")
 
     requirements = _quote_requirements(req)
+    game = _normalized_game(getattr(req, "game", "pokemon_tcg"))
 
     return {
         "display_name": card_name,
@@ -180,6 +232,7 @@ def _normalize_card_identity(req) -> dict:
         "rarity": rarity,
         "set_name": set_name,
         "set_code": set_code,
+        "game": game,
         "is_psa": requirements["grading_type"] == "psa",
         "psa_grade": req.psa_grade,
         "target_grade": requirements["label"],
@@ -390,8 +443,8 @@ def _listing_match(title: str, identity: dict) -> dict:
         reasons.append("set_code")
 
     # 保守模式：完整卡名 + 卡號必須同中；已知系列碼時亦必須命中。
-    required_identity = number_match and (name_match or not query_name) and (set_match or not set_code)
-    eligible = required_identity if card_number else (name_match and score >= 3 and (set_match or not set_code))
+    required_identity = number_match and (name_match or not query_name)
+    eligible = required_identity if card_number else (name_match and score >= 3)
     if not eligible:
         reasons.append("identity_not_exact")
     return {"score": score, "eligible": eligible, "reasons": reasons}
@@ -416,7 +469,7 @@ def _collect_price_points(sources: dict, req, identity: dict) -> list[dict]:
             "review_reason": "raw_condition_unknown",
         })
 
-    for source_key in ("snkr_dunk", "card_rush", "magi", "yahoo_auctions", "mercari_jp", "mercari_tw"):
+    for source_key in ("snkr_dunk", "card_rush", "magi", "yahoo_auctions", "bigweb", "mercari_jp", "mercari_tw"):
         source = sources.get(source_key)
         if not source:
             continue
@@ -536,6 +589,8 @@ def _build_summary(price_points: list[dict], req) -> dict | None:
 @app.get("/debug/html")
 async def debug_html(url: str = Query(...)):
     """fetch 一個 URL，返回 rendered HTML + 所有含價格嘅文字，幫助 debug scraper selector"""
+    if _is_one_piece_game(game):
+        return {}
     page = await _browser.new_page()
     try:
         await page.goto(url, wait_until="networkidle", timeout=30000)
@@ -602,11 +657,11 @@ async def _page_prices(page, min_val=200, max_val=5_000_000) -> list[int]:
 # FIX: 改用 /buy/poc/s/search（市場售價），加 rare= 參數過濾 rarity
 # FIX: 搜尋字串同時帶 card_name，精確度更高
 
-async def _scrape_yuyu_tei(card_number: str, card_name: str = "", rarity: str = "") -> dict:
+async def _scrape_yuyu_tei(card_number: str, card_name: str = "", rarity: str = "", game: str = "pokemon_tcg") -> dict:
     page = await _browser.new_page()
     try:
         # 組合搜尋字串：卡名 + 卡號（同 SNKR Dunk / Mercari 一樣）
-        search_word = f"{card_name} {card_number}".strip() if card_name else card_number
+        search_word = _search_keyword(card_number, card_name, rarity, game)
 
         # 組 URL：rare= 參數直接 filter rarity（遊々亭支援）
         params = f"?search_word={quote(search_word)}"
@@ -663,15 +718,15 @@ def _grade_stats(listings: list[dict], grade_key: str) -> dict | None:
     }
 
 
-async def _scrape_snkr_dunk(card_number: str, card_name: str = "", rarity: str = "") -> dict:
+async def _scrape_snkr_dunk(card_number: str, card_name: str = "", rarity: str = "", game: str = "pokemon_tcg") -> dict:
     """
     純 httpx，唔使 Playwright。
     FIX: keyword = 卡名 + 卡號 + rarity，過濾無關商品（波鞋等）。
     返回所有 listing，並按 PSA grade 分組統計 min/max/avg。
     """
     # 組合搜尋字串，包含 rarity
-    keyword_parts = " ".join(filter(None, [card_name, card_number, rarity]))
-    q = quote(keyword_parts or card_number)
+    keyword = _search_keyword(card_number, card_name, rarity, game)
+    q = quote(keyword or card_number)
 
     url = (
         f"https://snkrdunk.com/v3/search"
@@ -758,7 +813,7 @@ def _parse_cr_grade(name: str) -> str:
     return tag.replace("鑑定済", "").replace("※状態難/", "").strip() or "raw"
 
 
-async def _scrape_card_rush(card_number: str, card_name: str = "") -> dict:
+async def _scrape_card_rush(card_number: str, card_name: str = "", game: str = "pokemon_tcg") -> dict:
     """
     Apify Cheerio Scraper + RESIDENTIAL proxy，bypass Cloudflare。
     FIX: URL 帶兩個 field：
@@ -767,6 +822,8 @@ async def _scrape_card_rush(card_number: str, card_name: str = "") -> dict:
     ⚠️  請先用 /debug/html?url=https://www.cardrush-pokemon.jp/product-list
         確認 form field name（name 屬性），如唔係 keyword/keyword2 請更新。
     """
+    if _is_one_piece_game(game):
+        return {}
     apify_token = os.environ.get("APIFY_API_TOKEN", "")
     if not apify_token:
         raise RuntimeError("APIFY_API_TOKEN not set")
@@ -875,22 +932,29 @@ async def _scrape_card_rush(card_number: str, card_name: str = "") -> dict:
 
 # ── Scraper 4: magi marketplace listings ─────────────────────────────────
 
-async def _scrape_magi(card_number: str, card_name: str = "", rarity: str = "") -> dict:
+async def _scrape_magi(card_number: str, card_name: str = "", rarity: str = "", game: str = "pokemon_tcg") -> dict:
     """magi Pokemon 在售 + 已售 listings；保留逐項 title / URL 供 identity filter。"""
     page = await _stealth_context.new_page()
     try:
         # magi 多關鍵字係 OR search；rarity 會擴闊結果，所以只搜尋卡名 + 卡號，再逐項 AND filter。
-        keyword = " ".join(filter(None, [card_name, card_number]))
+        keyword = _search_keyword(card_number, card_name, rarity, game)
         q = quote(keyword or card_number, safe="")
         raw_items = []
         for status_param, status in (("presented", "active"), ("sold_out", "sold")):
-            url = (
-                "https://magi.camp/items/search"
-                f"?forms_search_items%5Bkeyword%5D={q}"
-                "&forms_search_items%5Bgoods_id%5D=1"
-                f"&forms_search_items%5Bstatus%5D={status_param}"
-                "&forms_search_items%5Binclude_oripa%5D=false"
-            )
+            if _is_one_piece_game(game):
+                url = (
+                    "https://magi.camp/items/search"
+                    f"?keyword={q}"
+                    f"&status={status_param}"
+                )
+            else:
+                url = (
+                    "https://magi.camp/items/search"
+                    f"?forms_search_items%5Bkeyword%5D={q}"
+                    "&forms_search_items%5Bgoods_id%5D=1"
+                    f"&forms_search_items%5Bstatus%5D={status_param}"
+                    "&forms_search_items%5Binclude_oripa%5D=false"
+                )
             await page.goto(url, wait_until="domcontentloaded", timeout=35000)
             try:
                 await page.wait_for_load_state("networkidle", timeout=10000)
@@ -948,14 +1012,14 @@ async def _scrape_magi(card_number: str, card_name: str = "", rarity: str = "") 
 
 # ── Scraper 5: Yahoo Auctions Japan ───────────────────────────────────────
 
-async def _scrape_yahoo_auctions(card_number: str, card_name: str = "", rarity: str = "") -> dict:
+async def _scrape_yahoo_auctions(card_number: str, card_name: str = "", rarity: str = "", game: str = "pokemon_tcg") -> dict:
     """
     Yahoo!オークション 在售搜尋頁。
     改用 httpx 直接抓 search HTML，避免 Zeabur Playwright timeout。
     """
     try:
-        keyword_parts = " ".join(filter(None, [card_name, card_number, rarity]))
-        q = quote(keyword_parts or card_number, safe="")
+        keyword = _search_keyword(card_number, card_name, rarity, game)
+        q = quote(keyword or card_number, safe="")
         url = f"https://auctions.yahoo.co.jp/search/search?p={q}&auccat=0"
         headers = {
             "User-Agent": _STEALTH_UA,
@@ -1045,6 +1109,65 @@ async def _scrape_yahoo_auctions(card_number: str, card_name: str = "", rarity: 
         raise RuntimeError(f"yahoo_auctions failed: {type(e).__name__}: {e}")
 
 
+async def _scrape_bigweb_one_piece(card_number: str, card_name: str = "", rarity: str = "", game: str = "pokemon_tcg") -> dict:
+    if not _is_one_piece_game(game):
+        return {}
+    query = re.sub(r"\s+", "", card_number or "").upper()
+    normalized_query = _normalize_set_code(query)
+    if not query:
+        return {}
+
+    async with httpx.AsyncClient(timeout=20, follow_redirects=True) as client:
+        response = await client.get(
+            "https://api.bigweb.co.jp/products",
+            params={"game_id": 177, "q": query},
+            headers={"User-Agent": _STEALTH_UA, "Accept-Language": "ja-JP,ja;q=0.9,en;q=0.8"},
+        )
+        response.raise_for_status()
+        payload = response.json()
+
+    items = payload.get("items") or []
+    listings = []
+    for item in items:
+        price = int(item.get("price") or 0)
+        if price <= 0 or item.get("is_supply") or item.get("is_box") or item.get("is_sold_out"):
+            continue
+        name = (item.get("name") or "").strip()
+        fname = (item.get("fname") or "").strip()
+        comment = (item.get("comment") or "").strip()
+        cardset = ((item.get("cardset") or {}).get("slip") or "").strip()
+        rarity_label = ((item.get("rarity") or {}).get("slip") or "").strip()
+        joined = " ".join(part for part in [name, fname, comment, cardset, rarity_label] if part)
+        if normalized_query not in _normalize_set_code(joined):
+            continue
+        if rarity and not _op_bigweb_rarity_match(rarity_label, rarity):
+            continue
+        if card_name and not _card_name_matches(joined, card_name):
+            continue
+        listings.append({
+            "price_jpy": price,
+            "grade": "raw",
+            "status": "active",
+            "name": joined,
+            "url": f"https://bigweb.co.jp/ja/products/onepiece/cardViewer/{item.get('id')}",
+        })
+
+    if not listings:
+        return {}
+
+    prices = [listing["price_jpy"] for listing in listings]
+    return {
+        "listing_count": len(listings),
+        "by_grade": {"raw": _grade_stats(listings, "raw")},
+        "overall": {
+            "min_jpy": min(prices),
+            "max_jpy": max(prices),
+            "avg_jpy": round(sum(prices) / len(prices)),
+        },
+        "listings": listings,
+    }
+
+
 # ── Scraper 6: Mercari JP / TW ────────────────────────────────────────────
 
 
@@ -1091,6 +1214,7 @@ async def _scrape_mercari_marketplace(
     card_number: str,
     card_name: str = "",
     rarity: str = "",
+    game: str = "pokemon_tcg",
     referer: str,
     sold_tokens: list[str],
 ) -> dict:
@@ -1099,8 +1223,8 @@ async def _scrape_mercari_marketplace(
         await page.add_init_script(_CR_STEALTH_SCRIPT)
         await page.set_extra_http_headers({"Referer": referer})
 
-        keyword_parts = " ".join(filter(None, [card_name, card_number, rarity]))
-        q = quote(keyword_parts or card_number, safe="")
+        keyword = _search_keyword(card_number, card_name, rarity, game)
+        q = quote(keyword or card_number, safe="")
 
         await page.goto(
             base_url.format(query=q),
@@ -1277,13 +1401,14 @@ async def _scrape_mercari_marketplace(
         await page.close()
 
 
-async def _scrape_mercari_tw(card_number: str, card_name: str = "", rarity: str = "") -> dict:
+async def _scrape_mercari_tw(card_number: str, card_name: str = "", rarity: str = "", game: str = "pokemon_tcg") -> dict:
     result = await _scrape_mercari_marketplace(
         base_url="https://tw.mercari.com/zh-hant/search?keyword={query}",
         currency="TWD",
         card_number=card_number,
         card_name=card_name,
         rarity=rarity,
+        game=game,
         referer="https://www.google.com.tw/",
         sold_tokens=["已售出", "sold", "sold out"],
     )
@@ -1295,13 +1420,14 @@ async def _scrape_mercari_tw(card_number: str, card_name: str = "", rarity: str 
     return result
 
 
-async def _scrape_mercari_jp(card_number: str, card_name: str = "", rarity: str = "") -> dict:
+async def _scrape_mercari_jp(card_number: str, card_name: str = "", rarity: str = "", game: str = "pokemon_tcg") -> dict:
     return await _scrape_mercari_marketplace(
         base_url="https://jp.mercari.com/search?keyword={query}",
         currency="JPY",
         card_number=card_number,
         card_name=card_name,
         rarity=rarity,
+        game=game,
         referer="https://www.google.co.jp/",
         sold_tokens=["売り切れ", "sold", "sold out"],
     )
@@ -1339,6 +1465,7 @@ async def scrape_cards(card_number: str) -> list[dict]:
 async def search(
     cardNumber: str = Query(..., example="234/193"),
     rarity:     str = Query(..., example="SAR"),
+    game:       str = Query(default="pokemon_tcg", example="pokemon_tcg"),
 ):
     try:
         return await scrape_cards(cardNumber)
@@ -1353,10 +1480,11 @@ async def magi_search(
     cardNumber: str = Query(..., example="030/100"),
     cardName:   str = Query(default="", example="ピカチュウV"),
     rarity:     str = Query(default="", example="RR"),
+    game:       str = Query(default="pokemon_tcg", example="pokemon_tcg"),
 ):
     """magi 在售 + 已售單卡，返回逐項 title / URL / grade / JPY + HKD。"""
     try:
-        rates, result = await asyncio.gather(_get_rates(), _scrape_magi(cardNumber, cardName, rarity))
+        rates, result = await asyncio.gather(_get_rates(), _scrape_magi(cardNumber, cardName, rarity, game))
         if not result:
             return {"card_number": cardNumber, "message": "no results found"}
         for stats in result.get("by_grade", {}).values():
@@ -1379,12 +1507,13 @@ async def mercari_search(
     cardName:   str = Query(default="", example="リザードンex"),
     rarity:     str = Query(default="", example="SAR"),
     market:     str = Query(default="tw", example="tw"),
+    game:       str = Query(default="pokemon_tcg", example="pokemon_tcg"),
 ):
     """Mercari 獨立查詢；預設 TW，可用 market=jp 切日本站。"""
     try:
         selected = (market or "tw").strip().lower()
         if selected == "jp":
-            rates, result = await asyncio.gather(_get_rates(), _scrape_mercari_jp(cardNumber, cardName, rarity))
+            rates, result = await asyncio.gather(_get_rates(), _scrape_mercari_jp(cardNumber, cardName, rarity, game))
             status = result.get("status") if result else None
             if status == "no_results":
                 return {"card_number": cardNumber, "message": "no results found"}
@@ -1407,7 +1536,7 @@ async def mercari_search(
             result["exchange_rates"] = rates
             return result
 
-        result = await _scrape_mercari_tw(cardNumber, cardName, rarity)
+        result = await _scrape_mercari_tw(cardNumber, cardName, rarity, game)
         status = result.get("status") if result else None
         if status == "no_results":
             return {"card_number": cardNumber, "message": "no results found"}
@@ -1439,10 +1568,11 @@ async def mercari_search(
 async def card_rush_search(
     cardNumber: str = Query(..., example="288/SM-P"),
     cardName:   str = Query(default="", example="リザードンex"),
+    game:       str = Query(default="pokemon_tcg", example="pokemon_tcg"),
 ):
     """Card Rush 獨立查詢，返回各 grade min/max/avg（含 HKD 換算）及在庫狀態。"""
     try:
-        rates, result = await asyncio.gather(_get_rates(), _scrape_card_rush(cardNumber, cardName))
+        rates, result = await asyncio.gather(_get_rates(), _scrape_card_rush(cardNumber, cardName, game))
         if not result:
             return {"card_number": cardNumber, "message": "no results found"}
         for stats in result.get("by_grade", {}).values():
@@ -1466,10 +1596,11 @@ async def yahoo_auctions_search(
     cardNumber: str = Query(..., example="030/100"),
     cardName:   str = Query(default="", example="ピカチュウV"),
     rarity:     str = Query(default="", example="RR"),
+    game:       str = Query(default="pokemon_tcg", example="pokemon_tcg"),
 ):
     """Yahoo!オークション獨立查詢，返回 active listings 分級統計（含 HKD 換算）。"""
     try:
-        rates, result = await asyncio.gather(_get_rates(), _scrape_yahoo_auctions(cardNumber, cardName, rarity))
+        rates, result = await asyncio.gather(_get_rates(), _scrape_yahoo_auctions(cardNumber, cardName, rarity, game))
         if not result:
             return {"card_number": cardNumber, "message": "no results found"}
         for stats in result.get("by_grade", {}).values():
@@ -1501,10 +1632,11 @@ async def snkr_dunk_search(
     cardNumber: str = Query(..., example="288/SM-P"),
     cardName:   str = Query(default="", example="リザードンex"),
     rarity:     str = Query(default="", example="SAR"),
+    game:       str = Query(default="pokemon_tcg", example="pokemon_tcg"),
 ):
     """SNKR Dunk 獨立查詢，返回 PSA8/PSA9/PSA10/raw 分組 min/max/avg（含 HKD 換算）。"""
     try:
-        rates, result = await asyncio.gather(_get_rates(), _scrape_snkr_dunk(cardNumber, cardName, rarity))
+        rates, result = await asyncio.gather(_get_rates(), _scrape_snkr_dunk(cardNumber, cardName, rarity, game))
         if not result:
             return {"card_number": cardNumber, "message": "no results found"}
         for grade, stats in result.get("by_grade", {}).items():
@@ -1521,6 +1653,38 @@ async def snkr_dunk_search(
         raise HTTPException(status_code=500, detail=str(e))
 
 
+# ── GET /bigweb ───────────────────────────────────────────────────────────
+
+@app.get("/bigweb")
+async def bigweb_search(
+    cardNumber: str = Query(..., example="OP01-120"),
+    cardName:   str = Query(default="", example="シャンクス"),
+    rarity:     str = Query(default="", example="SEC"),
+    game:       str = Query(default="one_piece_card_game", example="one_piece_card_game"),
+):
+    """BIGWEB One Piece 單獨查詢，返回可售 raw listings（含 HKD 換算）。"""
+    try:
+        rates, result = await asyncio.gather(_get_rates(), _scrape_bigweb_one_piece(cardNumber, cardName, rarity, game))
+        if not result:
+            return {"card_number": cardNumber, "message": "no results found"}
+        for stats in result.get("by_grade", {}).values():
+            stats["min_hkd"] = _jpy_to_hkd(stats["min_jpy"], rates)
+            stats["max_hkd"] = _jpy_to_hkd(stats["max_jpy"], rates)
+            stats["avg_hkd"] = _jpy_to_hkd(stats["avg_jpy"], rates)
+        ov = result["overall"]
+        ov["min_hkd"] = _jpy_to_hkd(ov["min_jpy"], rates)
+        ov["max_hkd"] = _jpy_to_hkd(ov["max_jpy"], rates)
+        ov["avg_hkd"] = _jpy_to_hkd(ov["avg_jpy"], rates)
+        result["listings"] = [
+            {**listing, "price_hkd": _jpy_to_hkd(listing["price_jpy"], rates), "currency": "JPY"}
+            for listing in result.get("listings", [])
+        ]
+        result["exchange_rates"] = rates
+        return result
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
+
+
 # ── GET /yuyu-tei ─────────────────────────────────────────────────────────
 
 @app.get("/yuyu-tei")
@@ -1528,10 +1692,11 @@ async def yuyu_tei_search(
     cardNumber: str = Query(..., example="110/080"),
     cardName:   str = Query(default="", example="メガリザードンXex"),
     rarity:     str = Query(default="", example="SAR"),
+    game:       str = Query(default="pokemon_tcg", example="pokemon_tcg"),
 ):
     """遊々亭獨立查詢（/buy/ 市場售價），支援 rarity filter。"""
     try:
-        rates, result = await asyncio.gather(_get_rates(), _scrape_yuyu_tei(cardNumber, cardName, rarity))
+        rates, result = await asyncio.gather(_get_rates(), _scrape_yuyu_tei(cardNumber, cardName, rarity, game))
         if not result:
             return {"card_number": cardNumber, "message": "no results found"}
         result["price_hkd"] = _jpy_to_hkd(result["price_jpy"], rates)
@@ -1548,6 +1713,7 @@ class PriceReportRequest(BaseModel):
     card_number: str
     set_name:    str = ""
     rarity:      str = ""
+    game:        str = "pokemon_tcg"
     intent:       str = ""
     grading_type: str = ""
     is_psa:      bool = False
@@ -1578,15 +1744,29 @@ async def price_report(req: PriceReportRequest):
     query_name = identity["query_name"]
     card_number = identity["card_number"]
     rarity = identity["rarity"]
-    yuyu, snkr, rush, magi, yahoo, merc_jp, merc_tw = await asyncio.gather(
-        _safe(_scrape_yuyu_tei(card_number, query_name, rarity),   "yuyu_tei",  timeout=35),
-        _safe(_scrape_snkr_dunk(card_number, query_name, rarity),  "snkr_dunk", timeout=20),
-        _safe(_scrape_card_rush(card_number, query_name),          "card_rush", timeout=120),
-        _safe(_scrape_magi(card_number, query_name, rarity),       "magi",      timeout=40),
-        _safe(_scrape_yahoo_auctions(card_number, query_name, rarity), "yahoo_auctions", timeout=40),
-        _safe(_scrape_mercari_jp(card_number, query_name, rarity), "mercari_jp", timeout=45),
-        _safe(_scrape_mercari_tw(card_number, query_name, rarity), "mercari_tw", timeout=45),
-    )
+    game = identity["game"]
+    if _is_one_piece_game(game):
+        yuyu = {}
+        rush = {}
+        snkr, magi, yahoo, merc_jp, merc_tw, bigweb = await asyncio.gather(
+            _safe(_scrape_snkr_dunk(card_number, query_name, rarity, game), "snkr_dunk", timeout=20),
+            _safe(_scrape_magi(card_number, query_name, rarity, game), "magi", timeout=40),
+            _safe(_scrape_yahoo_auctions(card_number, query_name, rarity, game), "yahoo_auctions", timeout=40),
+            _safe(_scrape_mercari_jp(card_number, query_name, rarity, game), "mercari_jp", timeout=45),
+            _safe(_scrape_mercari_tw(card_number, query_name, rarity, game), "mercari_tw", timeout=45),
+            _safe(_scrape_bigweb_one_piece(card_number, query_name, rarity, game), "bigweb", timeout=20),
+        )
+    else:
+        bigweb = {}
+        yuyu, snkr, rush, magi, yahoo, merc_jp, merc_tw = await asyncio.gather(
+            _safe(_scrape_yuyu_tei(card_number, query_name, rarity, game), "yuyu_tei", timeout=35),
+            _safe(_scrape_snkr_dunk(card_number, query_name, rarity, game), "snkr_dunk", timeout=20),
+            _safe(_scrape_card_rush(card_number, query_name, game), "card_rush", timeout=120),
+            _safe(_scrape_magi(card_number, query_name, rarity, game), "magi", timeout=40),
+            _safe(_scrape_yahoo_auctions(card_number, query_name, rarity, game), "yahoo_auctions", timeout=40),
+            _safe(_scrape_mercari_jp(card_number, query_name, rarity, game), "mercari_jp", timeout=45),
+            _safe(_scrape_mercari_tw(card_number, query_name, rarity, game), "mercari_tw", timeout=45),
+        )
 
     # ── 組裝 sources ──
     def _yuyu_out(r):
@@ -1600,7 +1780,7 @@ async def price_report(req: PriceReportRequest):
             "trust": "verified_card_shop",
         }
 
-    def _jpy_listings_out(r):
+    def _jpy_listings_out(r, trust: str = "listing_identity_checked"):
         if not r.get("overall"): return None
         by_grade_hkd = {}
         for grade, stats in r.get("by_grade", {}).items():
@@ -1630,7 +1810,7 @@ async def price_report(req: PriceReportRequest):
             },
             "listings": listings_hkd,
             "currency": "JPY",
-            "trust": "listing_identity_checked",
+            "trust": trust,
         }
 
     def _rush_out(r):
@@ -1706,6 +1886,7 @@ async def price_report(req: PriceReportRequest):
         "card_rush":     _rush_out(rush),
         "magi":          _jpy_listings_out(magi),
         "yahoo_auctions": _jpy_listings_out(yahoo),
+        "bigweb":        _jpy_listings_out(bigweb, trust="verified_card_shop"),
         "mercari_jp":    _jpy_listings_out(merc_jp),
         "mercari_tw":    _twd_listings_out(merc_tw),
         "mercari":       _twd_listings_out(merc_tw),
@@ -1754,6 +1935,7 @@ def _fmt_tg(card_label, ts, sources, price_points, summary, req, errors) -> str:
         "snkr_dunk": "SNKR",
         "card_rush": "Card Rush",
         "magi": "magi",
+        "bigweb": "BIGWEB",
         "yahoo_auctions": "Yahoo Auc",
         "mercari_jp": "Mercari JP",
         "mercari_tw": "Mercari TW",
@@ -1790,7 +1972,7 @@ def _fmt_tg(card_label, ts, sources, price_points, summary, req, errors) -> str:
                 and point.get("grade") == "raw"
                 and point.get("match_score", 0) >= 4
                 and point.get("price_hkd")
-                and point.get("source") in {"yuyu_tei", "magi"}
+                and point.get("source") in {"yuyu_tei", "magi", "bigweb"}
             ):
                 raw_reference.setdefault(point["source"], []).append(point["price_hkd"])
     if raw_reference:
