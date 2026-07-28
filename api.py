@@ -938,14 +938,18 @@ async def _scrape_magi(card_number: str, card_name: str = "", rarity: str = "", 
     try:
         # magi 多關鍵字係 OR search；rarity 會擴闊結果，所以只搜尋卡名 + 卡號，再逐項 AND filter。
         keyword = _search_keyword(card_number, card_name, rarity, game)
+        if _is_one_piece_game(game):
+            keyword = " ".join(part for part in [card_name.strip(), card_number.strip()] if part) or card_number
         q = quote(keyword or card_number, safe="")
         raw_items = []
         for status_param, status in (("presented", "active"), ("sold_out", "sold")):
             if _is_one_piece_game(game):
                 url = (
                     "https://magi.camp/items/search"
-                    f"?keyword={q}"
-                    f"&status={status_param}"
+                    f"?forms_search_items%5Bcard_title_id%5D=129"
+                    f"&forms_search_items%5Bkeyword%5D={q}"
+                    f"&forms_search_items%5Bstatus%5D={status_param}"
+                    "&forms_search_items%5Binclude_oripa%5D=false"
                 )
             else:
                 url = (
