@@ -588,7 +588,6 @@ async def _normalize_listings_with_llm(source_key: str, listings: list[tuple[int
             "index": idx,
             "title": title,
             "grade": listing.get("grade", ""),
-            "url": listing.get("url", ""),
         })
         index_lookup[idx] = listing
 
