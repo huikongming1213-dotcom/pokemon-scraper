@@ -106,6 +106,9 @@ def _llm_normalizer_settings() -> dict:
         or os.getenv("OPENROUTER_BASE_URL")
         or "https://api.openai.com/v1"
     ).rstrip("/")
+    model = (os.getenv("LLM_LISTING_NORMALIZER_MODEL") or "gpt-4.1-mini").strip()
+    if "openrouter.ai" in base_url.lower() and "/" not in model and model.startswith("gpt-"):
+        model = f"openai/{model}"
     enabled = _env_flag("LLM_LISTING_NORMALIZER_ENABLED", True) and bool(api_key)
     source_csv = os.getenv("LLM_LISTING_NORMALIZER_SOURCES", "mercari_jp,mercari_tw,yahoo_auctions,magi")
     sources = {part.strip() for part in source_csv.split(",") if part.strip()}
@@ -113,11 +116,73 @@ def _llm_normalizer_settings() -> dict:
         "enabled": enabled,
         "api_key": api_key,
         "base_url": base_url,
-        "model": os.getenv("LLM_LISTING_NORMALIZER_MODEL", "gpt-4.1-mini"),
+        "model": model,
         "max_listings": max(0, _clean_int(os.getenv("LLM_LISTING_NORMALIZER_MAX_LISTINGS")) or 12),
         "confidence_threshold": min(1.0, max(0.0, float(os.getenv("LLM_LISTING_NORMALIZER_MIN_CONFIDENCE", "0.8")))),
         "sources": sources,
     }
+
+
+def _llm_request_headers(settings: dict) -> dict:
+    headers = {
+        "Authorization": f"Bearer {settings['api_key']}",
+        "Content-Type": "application/json",
+    }
+    if "openrouter.ai" in settings["base_url"].lower():
+        referer = (
+            os.getenv("OPENROUTER_SITE_URL")
+            or os.getenv("APP_URL")
+            or os.getenv("PUBLIC_APP_URL")
+            or os.getenv("VERCEL_URL")
+            or ""
+        ).strip()
+        title = (
+            os.getenv("OPENROUTER_APP_NAME")
+            or os.getenv("APP_NAME")
+            or "pokemon-scraper"
+        ).strip()
+        if referer:
+            if not referer.startswith(("http://", "https://")):
+                referer = f"https://{referer.lstrip('/')}"
+            headers["HTTP-Referer"] = referer
+        if title:
+            headers["X-Title"] = title
+    return headers
+
+
+def _extract_llm_message_text(data: dict) -> str:
+    raw_content = data["choices"][0]["message"]["content"]
+    if isinstance(raw_content, list):
+        raw_content = "".join(
+            part.get("text", "") if isinstance(part, dict) else str(part)
+            for part in raw_content
+        )
+    return str(raw_content or "").strip()
+
+
+def _parse_llm_json_payload(raw_text: str) -> dict:
+    text = (raw_text or "").strip()
+    if text.startswith("```"):
+        text = re.sub(r"^```(?:json)?\s*", "", text)
+        text = re.sub(r"\s*```$", "", text)
+        text = text.strip()
+    try:
+        return json.loads(text)
+    except json.JSONDecodeError:
+        match = re.search(r"\{.*\}", text, flags=re.DOTALL)
+        if match:
+            return json.loads(match.group(0))
+        raise
+
+
+def _llm_error_label(exc: Exception) -> str:
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code if exc.response is not None else "n/a"
+        body = ""
+        if exc.response is not None:
+            body = _strip_html(exc.response.text or "")[:180]
+        return f"HTTPStatusError {status}: {body}".strip()
+    return type(exc).__name__
 
 
 # ── Grade normalization ────────────────────────────────────────────────────
@@ -583,18 +648,26 @@ async def _normalize_listings_with_llm(source_key: str, listings: list[tuple[int
         },
         "source": source_key,
         "items": payload_items,
+        "output_schema": schema,
     }
 
-    async with httpx.AsyncClient(timeout=20) as client:
-        response = await client.post(
-            f"{settings['base_url']}/chat/completions",
-            headers={
-                "Authorization": f"Bearer {settings['api_key']}",
-                "Content-Type": "application/json",
-            },
-            json={
-                "model": settings["model"],
-                "temperature": 0,
+    base_payload = {
+        "model": settings["model"],
+        "temperature": 0,
+        "messages": [
+            {"role": "system", "content": system_prompt},
+            {"role": "user", "content": json.dumps(user_prompt, ensure_ascii=False)},
+        ],
+    }
+    fallback_system_prompt = (
+        f"{system_prompt} "
+        "Return only valid JSON with no markdown fences and no extra commentary. "
+        "The response must match the provided output_schema exactly."
+    )
+    request_variants = [
+        {
+            "name": "json_schema",
+            "extra": {
                 "response_format": {
                     "type": "json_schema",
                     "json_schema": {
@@ -602,22 +675,46 @@ async def _normalize_listings_with_llm(source_key: str, listings: list[tuple[int
                         "schema": schema,
                     },
                 },
-                "messages": [
-                    {"role": "system", "content": system_prompt},
-                    {"role": "user", "content": json.dumps(user_prompt, ensure_ascii=False)},
-                ],
             },
-        )
-        response.raise_for_status()
-        data = response.json()
-
-    raw_content = data["choices"][0]["message"]["content"]
-    if isinstance(raw_content, list):
-        raw_content = "".join(
-            part.get("text", "") if isinstance(part, dict) else str(part)
-            for part in raw_content
-        )
-    parsed = json.loads(raw_content)
+        },
+        {
+            "name": "json_object",
+            "extra": {
+                "response_format": {"type": "json_object"},
+            },
+        },
+        {
+            "name": "plain_json",
+            "extra": {},
+        },
+    ]
+    parsed = None
+    last_error = None
+    async with httpx.AsyncClient(timeout=20) as client:
+        for variant in request_variants:
+            payload = dict(base_payload)
+            payload.update(variant["extra"])
+            if variant["name"] != "json_schema":
+                payload["messages"] = [
+                    {"role": "system", "content": fallback_system_prompt},
+                    {"role": "user", "content": json.dumps(user_prompt, ensure_ascii=False)},
+                ]
+            try:
+                response = await client.post(
+                    f"{settings['base_url']}/chat/completions",
+                    headers=_llm_request_headers(settings),
+                    json=payload,
+                )
+                response.raise_for_status()
+                parsed = _parse_llm_json_payload(_extract_llm_message_text(response.json()))
+                break
+            except (httpx.HTTPError, KeyError, TypeError, ValueError, json.JSONDecodeError) as exc:
+                last_error = exc
+                continue
+    if parsed is None:
+        if last_error is not None:
+            raise last_error
+        raise RuntimeError("LLM normalizer returned no payload")
     normalized_count = cached_count
     trusted_count = sum(
         1
@@ -705,7 +802,7 @@ async def _apply_llm_normalizer(sources: dict, identity: dict, errors: dict) -> 
     failures = []
     for result in results:
         if isinstance(result, Exception):
-            failures.append(type(result).__name__)
+            failures.append(_llm_error_label(result))
             continue
         debug["called_count"] += 1
         debug["requested_count"] += result.get("requested_count", 0)
