@@ -100,14 +100,19 @@ def _env_flag(name: str, default: bool = False) -> bool:
 
 
 def _llm_normalizer_settings() -> dict:
-    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    api_key = (os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY") or "").strip()
+    base_url = (
+        os.getenv("OPENAI_BASE_URL")
+        or os.getenv("OPENROUTER_BASE_URL")
+        or "https://api.openai.com/v1"
+    ).rstrip("/")
     enabled = _env_flag("LLM_LISTING_NORMALIZER_ENABLED", True) and bool(api_key)
     source_csv = os.getenv("LLM_LISTING_NORMALIZER_SOURCES", "mercari_jp,mercari_tw,yahoo_auctions,magi")
     sources = {part.strip() for part in source_csv.split(",") if part.strip()}
     return {
         "enabled": enabled,
         "api_key": api_key,
-        "base_url": os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/"),
+        "base_url": base_url,
         "model": os.getenv("LLM_LISTING_NORMALIZER_MODEL", "gpt-4.1-mini"),
         "max_listings": max(0, _clean_int(os.getenv("LLM_LISTING_NORMALIZER_MAX_LISTINGS")) or 12),
         "confidence_threshold": min(1.0, max(0.0, float(os.getenv("LLM_LISTING_NORMALIZER_MIN_CONFIDENCE", "0.8")))),
@@ -471,29 +476,39 @@ def _normalize_card_number_token(value: str) -> str:
     return re.sub(r"[^A-Z0-9]", "", normalized)
 
 
-def _listing_needs_llm(title: str, identity: dict) -> bool:
+def _listing_needs_llm(source_key: str, listing: dict, identity: dict) -> bool:
+    title = (listing.get("name") or "").strip()
     if not title:
         return False
     upper = unicodedata.normalize("NFKC", title).upper()
-    if any(term.upper() in upper for term in _HARD_NON_CARD_TERMS + _LOT_TERMS):
-        return True
-    match = _listing_match(title, identity)
-    if match["eligible"]:
+    if listing.get("llm_normalized", {}).get("trusted"):
         return False
+
+    polluted_sources = {"mercari_jp", "mercari_tw", "yahoo_auctions", "magi"}
+    has_explicit_noise = any(term.upper() in upper for term in _HARD_NON_CARD_TERMS + _LOT_TERMS)
+    if has_explicit_noise:
+        return True
+
+    match = _listing_match(title, identity)
     card_number = identity.get("card_number", "")
     query_name = identity.get("query_name", "")
     has_number = bool(card_number and card_number.upper() in upper)
     has_name = bool(query_name and _card_name_matches(title, query_name))
+    if source_key in polluted_sources and (has_number or has_name):
+        return True
+    if match["eligible"]:
+        return False
     return has_number or has_name
 
 
-async def _normalize_listings_with_llm(source_key: str, listings: list[dict], identity: dict) -> list[dict]:
+async def _normalize_listings_with_llm(source_key: str, listings: list[tuple[int, dict]], identity: dict) -> dict:
     settings = _llm_normalizer_settings()
     if not settings["enabled"] or not listings:
-        return []
+        return {"normalized_count": 0, "trusted_count": 0, "cached_count": 0, "requested_count": 0}
 
     payload_items = []
     index_lookup = {}
+    cached_count = 0
     for idx, listing in listings[:settings["max_listings"]]:
         title = (listing.get("name") or "").strip()
         if not title:
@@ -502,6 +517,7 @@ async def _normalize_listings_with_llm(source_key: str, listings: list[dict], id
         cached = _llm_listing_cache.get(cache_key)
         if cached is not None:
             listing["llm_normalized"] = cached
+            cached_count += 1
             continue
         payload_items.append({
             "index": idx,
@@ -512,7 +528,17 @@ async def _normalize_listings_with_llm(source_key: str, listings: list[dict], id
         index_lookup[idx] = listing
 
     if not payload_items:
-        return []
+        trusted_count = sum(
+            1
+            for _, listing in listings[:settings["max_listings"]]
+            if listing.get("llm_normalized", {}).get("trusted")
+        )
+        return {
+            "normalized_count": cached_count,
+            "trusted_count": trusted_count,
+            "cached_count": cached_count,
+            "requested_count": 0,
+        }
 
     schema = {
         "type": "object",
@@ -592,7 +618,12 @@ async def _normalize_listings_with_llm(source_key: str, listings: list[dict], id
             for part in raw_content
         )
     parsed = json.loads(raw_content)
-    trusted = []
+    normalized_count = cached_count
+    trusted_count = sum(
+        1
+        for _, listing in listings[:settings["max_listings"]]
+        if listing.get("llm_normalized", {}).get("trusted")
+    )
     for item in parsed.get("items", []):
         idx = item.get("index")
         listing = index_lookup.get(idx)
@@ -612,44 +643,78 @@ async def _normalize_listings_with_llm(source_key: str, listings: list[dict], id
         }
         listing["llm_normalized"] = normalized
         _llm_listing_cache[f"{source_key}|{(listing.get('name') or '').strip()}"] = normalized
-        trusted.append(normalized)
-    return trusted
+        normalized_count += 1
+        if normalized["trusted"]:
+            trusted_count += 1
+    return {
+        "normalized_count": normalized_count,
+        "trusted_count": trusted_count,
+        "cached_count": cached_count,
+        "requested_count": len(payload_items),
+    }
 
 
-async def _apply_llm_normalizer(sources: dict, identity: dict, errors: dict) -> None:
+async def _apply_llm_normalizer(sources: dict, identity: dict, errors: dict) -> dict:
     settings = _llm_normalizer_settings()
+    debug = {
+        "enabled": settings["enabled"],
+        "configured_sources": sorted(settings["sources"]),
+        "max_listings": settings["max_listings"],
+        "candidate_count": 0,
+        "selected_count": 0,
+        "called_count": 0,
+        "requested_count": 0,
+        "normalized_count": 0,
+        "trusted_count": 0,
+        "cached_count": 0,
+        "sources": [],
+        "skipped_reason": None,
+    }
     if not settings["enabled"] or settings["max_listings"] <= 0:
-        return
+        debug["skipped_reason"] = "disabled_or_no_api_key" if not settings["enabled"] else "max_listings_zero"
+        return debug
 
     candidates = []
     for source_key, source in sources.items():
         if source_key not in settings["sources"] or not source or not source.get("listings"):
             continue
         for idx, listing in enumerate(source.get("listings", [])):
-            if _listing_needs_llm(listing.get("name", ""), identity):
+            if _listing_needs_llm(source_key, listing, identity):
                 candidates.append((source_key, idx, listing))
 
+    debug["candidate_count"] = len(candidates)
     if not candidates:
-        return
+        debug["skipped_reason"] = "no_candidates"
+        return debug
 
     candidates = candidates[:settings["max_listings"]]
+    debug["selected_count"] = len(candidates)
     grouped: dict[str, list[tuple[int, dict]]] = {}
     for source_key, idx, listing in candidates:
         grouped.setdefault(source_key, []).append((idx, listing))
+    debug["sources"] = sorted(grouped)
 
     tasks = [
         _normalize_listings_with_llm(source_key, source_listings, identity)
         for source_key, source_listings in grouped.items()
     ]
     if not tasks:
-        return
+        debug["skipped_reason"] = "no_tasks"
+        return debug
     results = await asyncio.gather(*tasks, return_exceptions=True)
     failures = []
     for result in results:
         if isinstance(result, Exception):
             failures.append(type(result).__name__)
+            continue
+        debug["called_count"] += 1
+        debug["requested_count"] += result.get("requested_count", 0)
+        debug["normalized_count"] += result.get("normalized_count", 0)
+        debug["trusted_count"] += result.get("trusted_count", 0)
+        debug["cached_count"] += result.get("cached_count", 0)
     if failures:
         errors.setdefault("llm_normalizer", ", ".join(sorted(set(failures))))
+    return debug
 
 
 def _split_card_name_suffix(card_name: str) -> tuple[str, str]:
@@ -2264,7 +2329,7 @@ async def price_report(req: PriceReportRequest):
         "pricecharting": None,  # TODO: 正式版加入
     }
 
-    await _apply_llm_normalizer(sources, identity, errors)
+    llm_debug = await _apply_llm_normalizer(sources, identity, errors)
     price_points = _collect_price_points(sources, req, identity)
     summary = _build_summary(price_points, req)
 
@@ -2278,6 +2343,7 @@ async def price_report(req: PriceReportRequest):
         "sources":        sources,
         "price_points":   price_points,
         "summary":        summary,
+        "llm_debug":      llm_debug,
         "exchange_rates": rates,
         "errors":         errors or None,
         "tg_message":     _fmt_tg(card_label, now_hkt, sources, price_points, summary, req, errors),
