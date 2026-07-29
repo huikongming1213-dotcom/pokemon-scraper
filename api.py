@@ -57,6 +57,7 @@ app = FastAPI(title="Pokemon Card Price Scraper", lifespan=lifespan)
 
 _rate_cache: dict = {}
 RATE_FALLBACK = {"JPY_HKD": 0.052, "USD_HKD": 7.8}
+_llm_listing_cache: dict = {}
 
 
 async def _get_rates() -> dict:
@@ -89,6 +90,29 @@ def _usd_to_jpy(usd_amount: float, rates: dict) -> int:
 def _usd_to_twd(usd_amount: float, twd_hkd_rate: float, rates: dict) -> int:
     twd_per_usd = rates["USD_HKD"] / max(twd_hkd_rate, 0.000001)
     return round(usd_amount * twd_per_usd)
+
+
+def _env_flag(name: str, default: bool = False) -> bool:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    return raw.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _llm_normalizer_settings() -> dict:
+    api_key = os.getenv("OPENAI_API_KEY", "").strip()
+    enabled = _env_flag("LLM_LISTING_NORMALIZER_ENABLED", True) and bool(api_key)
+    source_csv = os.getenv("LLM_LISTING_NORMALIZER_SOURCES", "mercari_jp,mercari_tw,yahoo_auctions,magi")
+    sources = {part.strip() for part in source_csv.split(",") if part.strip()}
+    return {
+        "enabled": enabled,
+        "api_key": api_key,
+        "base_url": os.getenv("OPENAI_BASE_URL", "https://api.openai.com/v1").rstrip("/"),
+        "model": os.getenv("LLM_LISTING_NORMALIZER_MODEL", "gpt-4.1-mini"),
+        "max_listings": max(0, _clean_int(os.getenv("LLM_LISTING_NORMALIZER_MAX_LISTINGS")) or 12),
+        "confidence_threshold": min(1.0, max(0.0, float(os.getenv("LLM_LISTING_NORMALIZER_MIN_CONFIDENCE", "0.8")))),
+        "sources": sources,
+    }
 
 
 # ── Grade normalization ────────────────────────────────────────────────────
@@ -220,6 +244,11 @@ def _normalize_card_identity(req) -> dict:
             break
     if not set_code and set_name:
         set_code = _SET_CODE_MAP.get(set_name.lower(), "")
+    set_tokens = _extract_set_tokens(set_name)
+    if set_code:
+        set_tokens.add(_normalize_set_code(set_code))
+    elif set_tokens:
+        set_code = sorted(set_tokens, key=len, reverse=True)[0]
 
     requirements = _quote_requirements(req)
     game = _normalized_game(getattr(req, "game", "pokemon_tcg"))
@@ -230,8 +259,10 @@ def _normalize_card_identity(req) -> dict:
         "jp_name": jp_name,
         "card_number": card_number,
         "rarity": rarity,
+        "rarity_token": _normalize_rarity_token(rarity),
         "set_name": set_name,
         "set_code": set_code,
+        "set_tokens": set_tokens,
         "game": game,
         "is_psa": requirements["grading_type"] == "psa",
         "psa_grade": req.psa_grade,
@@ -349,6 +380,49 @@ _NON_CARD_TERMS = (
     "カードケース", "オリパ", "福袋", "フィギュア", "ぬいぐるみ",
 )
 
+_HARD_NON_CARD_TERMS = (
+    "スリーブ", "プレイマット", "カードケース", "オリパ", "福袋",
+    "フィギュア", "ぬいぐるみ", "空箱", "EMPTY BOX",
+)
+
+_LOT_TERMS = (
+    "まとめ売り", "まとめ", "セット売り", "引退品", "大量",
+    "コンプ", "詰め合わせ", "LOT",
+)
+
+_SET_TOKEN_PATTERNS = (
+    r"SVP\d+",
+    r"SV[A-Z]{2,}",
+    r"SV\d+[A-Z]?",
+    r"S-P",
+    r"S\d+[A-Z]?",
+    r"SM\d+[A-Z]?",
+    r"OP\d+",
+    r"ST\d+",
+    r"EB\d+",
+    r"PRB\d+",
+    r"P\d+",
+)
+
+_RARITY_TOKEN_PATTERNS = {
+    "ACESPEC": r"ACE[\s\-]?SPEC",
+    "SECP": r"SEC[\s/\-]?P",
+    "SAR": r"(?<![A-Z0-9])SAR(?![A-Z0-9])",
+    "SSR": r"(?<![A-Z0-9])SSR(?![A-Z0-9])",
+    "CSR": r"(?<![A-Z0-9])CSR(?![A-Z0-9])",
+    "CHR": r"(?<![A-Z0-9])CHR(?![A-Z0-9])",
+    "RRR": r"(?<![A-Z0-9])RRR(?![A-Z0-9])",
+    "RR": r"(?<![A-Z0-9])RR(?![A-Z0-9])",
+    "SR": r"(?<![A-Z0-9])SR(?![A-Z0-9])",
+    "UR": r"(?<![A-Z0-9])UR(?![A-Z0-9])",
+    "HR": r"(?<![A-Z0-9])HR(?![A-Z0-9])",
+    "AR": r"(?<![A-Z0-9])AR(?![A-Z0-9])",
+    "ACE": r"(?<![A-Z0-9])ACE(?![A-Z0-9])",
+    "SEC": r"(?<![A-Z0-9])SEC(?![A-Z0-9])",
+    "SP": r"(?<![A-Z0-9])SP(?![A-Z0-9])",
+    "PR": r"(?<![A-Z0-9])PR(?![A-Z0-9])",
+}
+
 
 _CARD_NAME_SUFFIXES = ("VMAX", "VSTAR", "VUNION", "GX", "EX", "ex", "LVX", "V")
 
@@ -368,6 +442,214 @@ def _clean_marketplace_title(text: str) -> str:
     cleaned = re.sub(r"\s+のサムネイル$", "", cleaned)
     cleaned = re.sub(r"\s+thumbnail$", "", cleaned, flags=re.IGNORECASE)
     return cleaned.strip()
+
+
+def _extract_set_tokens(text: str) -> set[str]:
+    upper = unicodedata.normalize("NFKC", text or "").upper()
+    found = set()
+    for pattern in _SET_TOKEN_PATTERNS:
+        for match in re.finditer(pattern, upper):
+            found.add(_normalize_set_code(match.group(0)))
+    return found
+
+
+def _normalize_rarity_token(value: str) -> str:
+    return re.sub(r"[^A-Z0-9]", "", unicodedata.normalize("NFKC", value or "").upper())
+
+
+def _extract_rarity_tokens(text: str) -> set[str]:
+    upper = unicodedata.normalize("NFKC", text or "").upper()
+    found = set()
+    for token, pattern in _RARITY_TOKEN_PATTERNS.items():
+        if re.search(pattern, upper):
+            found.add(token)
+    return found
+
+
+def _normalize_card_number_token(value: str) -> str:
+    normalized = unicodedata.normalize("NFKC", value or "").upper()
+    return re.sub(r"[^A-Z0-9]", "", normalized)
+
+
+def _listing_needs_llm(title: str, identity: dict) -> bool:
+    if not title:
+        return False
+    upper = unicodedata.normalize("NFKC", title).upper()
+    if any(term.upper() in upper for term in _HARD_NON_CARD_TERMS + _LOT_TERMS):
+        return True
+    match = _listing_match(title, identity)
+    if match["eligible"]:
+        return False
+    card_number = identity.get("card_number", "")
+    query_name = identity.get("query_name", "")
+    has_number = bool(card_number and card_number.upper() in upper)
+    has_name = bool(query_name and _card_name_matches(title, query_name))
+    return has_number or has_name
+
+
+async def _normalize_listings_with_llm(source_key: str, listings: list[dict], identity: dict) -> list[dict]:
+    settings = _llm_normalizer_settings()
+    if not settings["enabled"] or not listings:
+        return []
+
+    payload_items = []
+    index_lookup = {}
+    for idx, listing in listings[:settings["max_listings"]]:
+        title = (listing.get("name") or "").strip()
+        if not title:
+            continue
+        cache_key = f"{source_key}|{title}"
+        cached = _llm_listing_cache.get(cache_key)
+        if cached is not None:
+            listing["llm_normalized"] = cached
+            continue
+        payload_items.append({
+            "index": idx,
+            "title": title,
+            "grade": listing.get("grade", ""),
+            "url": listing.get("url", ""),
+        })
+        index_lookup[idx] = listing
+
+    if not payload_items:
+        return []
+
+    schema = {
+        "type": "object",
+        "properties": {
+            "items": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "properties": {
+                        "index": {"type": "integer"},
+                        "canonical_name": {"type": "string"},
+                        "card_number": {"type": "string"},
+                        "set_code": {"type": "string"},
+                        "rarity": {"type": "string"},
+                        "grade": {"type": "string"},
+                        "is_bundle": {"type": "boolean"},
+                        "is_accessory": {"type": "boolean"},
+                        "confidence": {"type": "number"},
+                        "reason": {"type": "string"},
+                    },
+                    "required": ["index", "canonical_name", "card_number", "set_code", "rarity", "grade", "is_bundle", "is_accessory", "confidence", "reason"],
+                    "additionalProperties": False,
+                },
+            },
+        },
+        "required": ["items"],
+        "additionalProperties": False,
+    }
+
+    system_prompt = (
+        "You normalize trading card listing titles into structured metadata. "
+        "Do not guess missing values. Leave unknown fields as empty strings. "
+        "Mark bundle/accessory only when title explicitly indicates it."
+    )
+    user_prompt = {
+        "target": {
+            "card_name": identity.get("query_name", ""),
+            "card_number": identity.get("card_number", ""),
+            "set_code": identity.get("set_code", ""),
+            "rarity": identity.get("rarity", ""),
+            "game": identity.get("game", "pokemon_tcg"),
+        },
+        "source": source_key,
+        "items": payload_items,
+    }
+
+    async with httpx.AsyncClient(timeout=20) as client:
+        response = await client.post(
+            f"{settings['base_url']}/chat/completions",
+            headers={
+                "Authorization": f"Bearer {settings['api_key']}",
+                "Content-Type": "application/json",
+            },
+            json={
+                "model": settings["model"],
+                "temperature": 0,
+                "response_format": {
+                    "type": "json_schema",
+                    "json_schema": {
+                        "name": "listing_normalization",
+                        "schema": schema,
+                    },
+                },
+                "messages": [
+                    {"role": "system", "content": system_prompt},
+                    {"role": "user", "content": json.dumps(user_prompt, ensure_ascii=False)},
+                ],
+            },
+        )
+        response.raise_for_status()
+        data = response.json()
+
+    raw_content = data["choices"][0]["message"]["content"]
+    if isinstance(raw_content, list):
+        raw_content = "".join(
+            part.get("text", "") if isinstance(part, dict) else str(part)
+            for part in raw_content
+        )
+    parsed = json.loads(raw_content)
+    trusted = []
+    for item in parsed.get("items", []):
+        idx = item.get("index")
+        listing = index_lookup.get(idx)
+        if listing is None:
+            continue
+        normalized = {
+            "canonical_name": (item.get("canonical_name") or "").strip(),
+            "card_number": re.sub(r"\s+", "", item.get("card_number") or ""),
+            "set_code": _normalize_set_code(item.get("set_code") or ""),
+            "rarity": _normalize_rarity_token(item.get("rarity") or ""),
+            "grade": _normalize_grade(item.get("grade") or ""),
+            "is_bundle": bool(item.get("is_bundle")),
+            "is_accessory": bool(item.get("is_accessory")),
+            "confidence": float(item.get("confidence") or 0),
+            "reason": (item.get("reason") or "").strip(),
+            "trusted": float(item.get("confidence") or 0) >= settings["confidence_threshold"],
+        }
+        listing["llm_normalized"] = normalized
+        _llm_listing_cache[f"{source_key}|{(listing.get('name') or '').strip()}"] = normalized
+        trusted.append(normalized)
+    return trusted
+
+
+async def _apply_llm_normalizer(sources: dict, identity: dict, errors: dict) -> None:
+    settings = _llm_normalizer_settings()
+    if not settings["enabled"] or settings["max_listings"] <= 0:
+        return
+
+    candidates = []
+    for source_key, source in sources.items():
+        if source_key not in settings["sources"] or not source or not source.get("listings"):
+            continue
+        for idx, listing in enumerate(source.get("listings", [])):
+            if _listing_needs_llm(listing.get("name", ""), identity):
+                candidates.append((source_key, idx, listing))
+
+    if not candidates:
+        return
+
+    candidates = candidates[:settings["max_listings"]]
+    grouped: dict[str, list[tuple[int, dict]]] = {}
+    for source_key, idx, listing in candidates:
+        grouped.setdefault(source_key, []).append((idx, listing))
+
+    tasks = [
+        _normalize_listings_with_llm(source_key, source_listings, identity)
+        for source_key, source_listings in grouped.items()
+    ]
+    if not tasks:
+        return
+    results = await asyncio.gather(*tasks, return_exceptions=True)
+    failures = []
+    for result in results:
+        if isinstance(result, Exception):
+            failures.append(type(result).__name__)
+    if failures:
+        errors.setdefault("llm_normalizer", ", ".join(sorted(set(failures))))
 
 
 def _split_card_name_suffix(card_name: str) -> tuple[str, str]:
@@ -408,42 +690,104 @@ def _card_name_matches(title: str, card_name: str) -> bool:
         start = index + 1
 
 
-def _listing_match(title: str, identity: dict) -> dict:
-    text = (title or "").strip()
+def _listing_match(title_or_listing, identity: dict) -> dict:
+    listing = title_or_listing if isinstance(title_or_listing, dict) else {}
+    text = ((listing.get("name") if listing else title_or_listing) or "").strip()
     upper = text.upper()
     reasons = []
     score = 0
+    normalized = listing.get("llm_normalized") or {}
+    normalized_trusted = bool(normalized.get("trusted"))
 
     card_number = identity.get("card_number", "")
-    number_match = bool(card_number and card_number.upper() in upper)
+    normalized_card_number = normalized.get("card_number", "") if normalized_trusted else ""
+    number_match = bool(
+        card_number and (
+            card_number.upper() in upper
+            or (
+                normalized_card_number
+                and _normalize_card_number_token(normalized_card_number) == _normalize_card_number_token(card_number)
+            )
+        )
+    )
     if number_match:
         score += 4
-        reasons.append("card_number")
+        reasons.append("card_number" if card_number.upper() in upper else "llm_card_number")
 
     # 單卡 title 有時會帶「拡張パック」作為系列名；卡號 exact match 時唔當商品包裝排除。
     excluded_term = next((term for term in _NON_CARD_TERMS if term.upper() in upper), None)
     if excluded_term and not number_match:
         return {"score": 0, "eligible": False, "reasons": [f"non_card:{excluded_term}"]}
+    if normalized_trusted and normalized.get("is_accessory"):
+        return {"score": score, "eligible": False, "reasons": ["llm_non_card:accessory"]}
+    if normalized_trusted and normalized.get("is_bundle"):
+        return {"score": score, "eligible": False, "reasons": ["llm_bundle"]}
+    hard_excluded = next((term for term in _HARD_NON_CARD_TERMS if term.upper() in upper), None)
+    if hard_excluded:
+        return {"score": score, "eligible": False, "reasons": [f"non_card:{hard_excluded}"]}
+    lot_term = next((term for term in _LOT_TERMS if term.upper() in upper), None)
+    if lot_term:
+        return {"score": score, "eligible": False, "reasons": [f"lot_listing:{lot_term}"]}
 
     query_name = identity.get("query_name", "")
-    name_match = bool(query_name and _card_name_matches(text, query_name))
+    normalized_name = normalized.get("canonical_name", "") if normalized_trusted else ""
+    name_match = bool(
+        query_name and (
+            _card_name_matches(text, query_name)
+            or (normalized_name and _card_name_matches(normalized_name, query_name))
+        )
+    )
     if name_match:
         score += 2
-        reasons.append("card_name")
+        reasons.append("card_name" if _card_name_matches(text, query_name) else "llm_card_name")
 
     rarity = identity.get("rarity", "")
-    if rarity and re.search(rf"(?<![A-Z0-9]){re.escape(rarity)}(?![A-Z0-9])", upper):
+    normalized_rarity = normalized.get("rarity", "") if normalized_trusted else ""
+    rarity_match = bool(
+        rarity and (
+            re.search(rf"(?<![A-Z0-9]){re.escape(rarity)}(?![A-Z0-9])", upper)
+            or normalized_rarity == _normalize_rarity_token(rarity)
+        )
+    )
+    if rarity_match:
         score += 1
-        reasons.append("rarity")
+        reasons.append("rarity" if re.search(rf"(?<![A-Z0-9]){re.escape(rarity)}(?![A-Z0-9])", upper) else "llm_rarity")
 
     set_code = identity.get("set_code", "")
-    set_match = bool(set_code and set_code.upper() in upper)
+    normalized_set = normalized.get("set_code", "") if normalized_trusted else ""
+    set_match = bool(
+        set_code and (
+            set_code.upper() in upper
+            or (normalized_set and normalized_set == _normalize_set_code(set_code))
+        )
+    )
     if set_match:
         score += 1
-        reasons.append("set_code")
+        reasons.append("set_code" if set_code.upper() in upper else "llm_set_code")
 
-    # 保守模式：完整卡名 + 卡號必須同中；已知系列碼時亦必須命中。
-    required_identity = number_match and (name_match or not query_name)
+    target_set_tokens = set(identity.get("set_tokens") or [])
+    title_set_tokens = _extract_set_tokens(text)
+    if normalized_set:
+        title_set_tokens.add(normalized_set)
+    set_conflict = bool(target_set_tokens and title_set_tokens and title_set_tokens.isdisjoint(target_set_tokens))
+    if set_conflict:
+        reasons.append("conflicting_set_code")
+
+    target_rarity = identity.get("rarity_token", "")
+    title_rarity_tokens = _extract_rarity_tokens(text)
+    if normalized_rarity:
+        title_rarity_tokens.add(normalized_rarity)
+    rarity_conflict = bool(
+        target_rarity
+        and len(target_rarity) >= 2
+        and title_rarity_tokens
+        and target_rarity not in title_rarity_tokens
+    )
+    if rarity_conflict:
+        reasons.append("conflicting_rarity")
+
+    # 保守模式：完整卡名 + 卡號必須同中；若 title 明確寫咗另一個 set / rarity，直接當衝突擋走。
+    required_identity = number_match and (name_match or not query_name) and not set_conflict and not rarity_conflict
     eligible = required_identity if card_number else (name_match and score >= 3)
     if not eligible:
         reasons.append("identity_not_exact")
@@ -466,6 +810,7 @@ def _collect_price_points(sources: dict, req, identity: dict) -> list[dict]:
             "match_score": 7,
             "match_reasons": ["dedicated_card_shop", "card_number"],
             "quote_eligible": requirements["grading_type"] == "raw" and "missing_raw_condition" in requirements["warnings"],
+            "baseline_eligible": requirements["grading_type"] == "raw" and "missing_raw_condition" in requirements["warnings"],
             "review_reason": "raw_condition_unknown",
         })
 
@@ -474,7 +819,7 @@ def _collect_price_points(sources: dict, req, identity: dict) -> list[dict]:
         if not source:
             continue
         for listing in source.get("listings", []):
-            match = _listing_match(listing.get("name", ""), identity)
+            match = _listing_match(listing, identity)
             grade = _normalize_grade(listing.get("grade") or "raw")
             condition = grade if grade in {"A", "B", "C", "D"} else None
             raw_unknown_allowed = (
@@ -483,6 +828,12 @@ def _collect_price_points(sources: dict, req, identity: dict) -> list[dict]:
                 and "missing_raw_condition" in requirements["warnings"]
             )
             eligible_grade = grade in requirements["eligible_grades"] or raw_unknown_allowed
+            quote_eligible = match["eligible"] and eligible_grade
+            source_policy_excluded = (
+                requirements["grading_type"] == "psa"
+                and source_key == "mercari_jp"
+                and grade.startswith("PSA")
+            )
             points.append({
                 "source": source_key,
                 "grade": grade,
@@ -494,9 +845,11 @@ def _collect_price_points(sources: dict, req, identity: dict) -> list[dict]:
                 "name": listing.get("name", ""),
                 "match_score": match["score"],
                 "match_reasons": match["reasons"],
-                "quote_eligible": match["eligible"] and eligible_grade,
+                "quote_eligible": quote_eligible,
+                "baseline_eligible": quote_eligible and not source_policy_excluded,
                 "review_reason": (
-                    None if match["eligible"] and eligible_grade
+                    "source_policy_excluded" if quote_eligible and source_policy_excluded
+                    else None if quote_eligible
                     else "raw_condition_unknown" if match["eligible"] and grade == "raw"
                     else "identity_or_grade_mismatch"
                 ),
@@ -513,6 +866,7 @@ def _collect_price_points(sources: dict, req, identity: dict) -> list[dict]:
                     "match_score": 0,
                     "match_reasons": ["aggregate_without_listing_identity"],
                     "quote_eligible": False,
+                    "baseline_eligible": False,
                     "review_reason": "cannot_verify_listing_identity",
                 })
 
@@ -522,7 +876,7 @@ def _collect_price_points(sources: dict, req, identity: dict) -> list[dict]:
 def _build_summary(price_points: list[dict], req) -> dict | None:
     requirements = _quote_requirements(req)
     target_grade = requirements["label"]
-    eligible = [p for p in price_points if p.get("quote_eligible") and p.get("price_hkd")]
+    eligible = [p for p in price_points if p.get("baseline_eligible") and p.get("price_hkd")]
 
     if not eligible:
         return {
@@ -539,6 +893,19 @@ def _build_summary(price_points: list[dict], req) -> dict | None:
     active_values = [p["price_hkd"] for p in eligible if p["status"] == "active"]
     sample_count = sum(p.get("count", 1) for p in eligible)
     source_count = len({p["source"] for p in eligible})
+
+    if requirements["grading_type"] == "psa" and source_count < 2:
+        return {
+            "target_grade": target_grade,
+            "eligible_grades": requirements["eligible_grades"],
+            "confidence": "manual",
+            "reason": "psa_needs_multi_source",
+            "price_point_count": len(eligible),
+            "sample_count": sample_count,
+            "source_count": source_count,
+            "sources_used": sorted({p["source"] for p in eligible}),
+            "warnings": requirements["warnings"],
+        }
 
     if len(sold_values) >= 2:
         base = _median_int(sold_values)
@@ -1897,6 +2264,7 @@ async def price_report(req: PriceReportRequest):
         "pricecharting": None,  # TODO: 正式版加入
     }
 
+    await _apply_llm_normalizer(sources, identity, errors)
     price_points = _collect_price_points(sources, req, identity)
     summary = _build_summary(price_points, req)
 
@@ -1946,7 +2314,7 @@ def _fmt_tg(card_label, ts, sources, price_points, summary, req, errors) -> str:
     }
     grouped: dict[tuple[str, str], list[int]] = {}
     for point in price_points:
-        if not point.get("quote_eligible") or not point.get("price_hkd"):
+        if not point.get("baseline_eligible") or not point.get("price_hkd"):
             continue
         grade = point.get("grade", "raw")
         grouped.setdefault((point["source"], grade), []).append(point["price_hkd"])
@@ -1986,13 +2354,30 @@ def _fmt_tg(card_label, ts, sources, price_points, summary, req, errors) -> str:
         ]
         lines += ["", "ℹ️ 卡況未標示（唔納入 A/B/C/D 基準）", *ref_lines]
 
+    excluded_reference: dict[tuple[str, str], list[int]] = {}
+    for point in price_points:
+        if (
+            not point.get("baseline_eligible")
+            and point.get("review_reason") == "source_policy_excluded"
+            and point.get("price_hkd")
+        ):
+            key = (point["source"], point.get("grade", "raw"))
+            excluded_reference.setdefault(key, []).append(point["price_hkd"])
+    if excluded_reference:
+        excluded_lines = [
+            f"{source_labels.get(source, source)} {grade}：HK${min(values):,}-HK${max(values):,}"
+            for (source, grade), values in sorted(excluded_reference.items())
+        ]
+        lines += ["", "ℹ️ 已核對但暫不納入自動基準", *excluded_lines]
+
     possible_reference: dict[tuple[str, str], list[int]] = {}
     for point in price_points:
         if (
-            not point.get("quote_eligible")
+            not point.get("baseline_eligible")
             and point.get("match_score", 0) >= 6
             and point.get("grade") in requirements["eligible_grades"]
             and point.get("price_hkd")
+            and point.get("review_reason") != "source_policy_excluded"
         ):
             key = (point["source"], point.get("grade", "raw"))
             possible_reference.setdefault(key, []).append(point["price_hkd"])
@@ -2003,7 +2388,7 @@ def _fmt_tg(card_label, ts, sources, price_points, summary, req, errors) -> str:
         ]
         lines += ["", "ℹ️ 卡名/卡號中，但系列未確認或不符（不入基準）", *possible_lines]
 
-    rejected_count = sum(1 for p in price_points if not p.get("quote_eligible"))
+    rejected_count = sum(1 for p in price_points if not p.get("baseline_eligible"))
     if rejected_count:
         lines.append(f"🧹 已隔離 {rejected_count} 個不符條件／未能核對樣本")
 
@@ -2017,7 +2402,11 @@ def _fmt_tg(card_label, ts, sources, price_points, summary, req, errors) -> str:
             "⚠️ 試算只供老細參考，最終由老細手動報價俾客。",
         ]
     elif summary and summary.get("confidence") == "manual":
-        lines += ["", f"⚠️ 未搵到 {summary.get('target_grade', requirements['label'])} 嘅已核對樣本，需要人手逐網覆核。"]
+        reason = summary.get("reason")
+        if reason == "psa_needs_multi_source":
+            lines += ["", "⚠️ 已搵到樣本，但未達 PSA 自動試算門檻（至少 2 個可信來源），需要人手逐網覆核。"]
+        else:
+            lines += ["", f"⚠️ 未搵到 {summary.get('target_grade', requirements['label'])} 嘅已核對樣本，需要人手逐網覆核。"]
 
     if requirements["warnings"]:
         lines.append("⚠️ 客人資料未完整，今次只可當寬鬆市場參考。")
