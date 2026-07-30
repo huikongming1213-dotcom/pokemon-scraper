@@ -194,6 +194,14 @@ def _llm_error_label(exc: Exception) -> str:
     return type(exc).__name__
 
 
+_LLM_SOURCE_PRIORITY = {
+    "mercari_jp": 0,
+    "mercari_tw": 1,
+    "yahoo_auctions": 2,
+    "magi": 3,
+}
+
+
 # ── Grade normalization ────────────────────────────────────────────────────
 
 def _normalize_grade(grade: str) -> str:
@@ -792,6 +800,7 @@ async def _apply_llm_normalizer(sources: dict, identity: dict, errors: dict) -> 
         debug["skipped_reason"] = "no_candidates"
         return debug
 
+    candidates.sort(key=lambda item: (_LLM_SOURCE_PRIORITY.get(item[0], 99), item[1]))
     candidates = candidates[:settings["max_listings"]]
     debug["selected_count"] = len(candidates)
     grouped: dict[str, list[tuple[int, dict]]] = {}
