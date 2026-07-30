@@ -106,7 +106,8 @@ def _llm_normalizer_settings() -> dict:
         or os.getenv("OPENROUTER_BASE_URL")
         or "https://api.openai.com/v1"
     ).rstrip("/")
-    model = (os.getenv("LLM_LISTING_NORMALIZER_MODEL") or "gpt-4.1-mini").strip()
+    default_model = "deepseek/deepseek-v4-flash" if "openrouter.ai" in base_url.lower() else "gpt-4.1-mini"
+    model = (os.getenv("LLM_LISTING_NORMALIZER_MODEL") or default_model).strip()
     if "openrouter.ai" in base_url.lower() and "/" not in model and model.startswith("gpt-"):
         model = f"openai/{model}"
     enabled = _env_flag("LLM_LISTING_NORMALIZER_ENABLED", True) and bool(api_key)
