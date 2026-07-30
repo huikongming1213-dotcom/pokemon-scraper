@@ -983,6 +983,7 @@ def _collect_price_points(sources: dict, req, identity: dict) -> list[dict]:
         for listing in source.get("listings", []):
             match = _listing_match(listing, identity)
             grade = _normalize_grade(listing.get("grade") or "raw")
+            normalized_trusted = bool((listing.get("llm_normalized") or {}).get("trusted"))
             condition = grade if grade in {"A", "B", "C", "D"} else None
             raw_unknown_allowed = (
                 grade == "raw"
@@ -993,8 +994,9 @@ def _collect_price_points(sources: dict, req, identity: dict) -> list[dict]:
             quote_eligible = match["eligible"] and eligible_grade
             source_policy_excluded = (
                 requirements["grading_type"] == "psa"
-                and source_key == "mercari_jp"
+                and source_key in {"mercari_jp", "mercari_tw"}
                 and grade.startswith("PSA")
+                and not normalized_trusted
             )
             points.append({
                 "source": source_key,
