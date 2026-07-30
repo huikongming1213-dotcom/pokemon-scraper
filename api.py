@@ -87,9 +87,17 @@ def _usd_to_jpy(usd_amount: float, rates: dict) -> int:
     return round(usd_amount * jpy_per_usd)
 
 
+def _hkd_to_jpy(hkd_amount: float, rates: dict) -> int:
+    return round(hkd_amount / max(rates["JPY_HKD"], 0.000001))
+
+
 def _usd_to_twd(usd_amount: float, twd_hkd_rate: float, rates: dict) -> int:
     twd_per_usd = rates["USD_HKD"] / max(twd_hkd_rate, 0.000001)
     return round(usd_amount * twd_per_usd)
+
+
+def _hkd_to_twd(hkd_amount: float, twd_hkd_rate: float) -> int:
+    return round(hkd_amount / max(twd_hkd_rate, 0.000001))
 
 
 def _env_flag(name: str, default: bool = False) -> bool:
@@ -1773,6 +1781,7 @@ async def _scrape_mercari_marketplace(
         payload = await page.evaluate(r"""(config) => {
             const soldTokens = (config.soldTokens || []).map(token => token.toLowerCase());
             const noisePatterns = [
+                /^HK\$\s*[\d,.]+$/i,
                 /^NT\$\s*[\d,]+$/i,
                 /^US\$\s*[\d,.]+$/i,
                 /^[\u00A5\uFFE5]\s*[\d,]+$/i,
@@ -1798,11 +1807,11 @@ async def _scrape_mercari_marketplace(
                 seen.add(abs);
 
                 let container = link;
-                for (let i = 0; i < 4 && container.parentElement; i++) {
+                for (let i = 0; i < 2 && container.parentElement; i++) {
                     container = container.parentElement;
                 }
 
-                const text = (container.innerText || link.innerText || '').replace(/\u00a0/g, ' ').trim();
+                const text = (link.innerText || container.innerText || '').replace(/\u00a0/g, ' ').trim();
                 if (!text) continue;
 
                 const prices = [];
@@ -1827,10 +1836,13 @@ async def _scrape_mercari_marketplace(
                     const next = linesForPrice[i + 1] || '';
                     const twInline = line.match(/NT\$\s*([\d,]+)/i);
                     if (twInline) addPrice('TWD', twInline[1]);
+                    const hkInline = line.match(/HK\$\s*([\d,.]+)/i);
+                    if (hkInline) addPrice('HKD', hkInline[1]);
                     const jpInline = line.match(/[\u00A5\uFFE5]\s*([\d,]+)/i) || line.match(/([\d,]+)\s*\u5186/i);
                     if (jpInline) addPrice('JPY', jpInline[1]);
                     const usdInline = line.match(/US\$\s*([\d,.]+)/i);
                     if (usdInline) addPrice('USD', usdInline[1]);
+                    if (/^HK\$$/i.test(line) && next) addPrice('HKD', next);
                     if (/^US\$$/i.test(line) && next) addPrice('USD', next);
                     if (/^NT\$$/i.test(line) && next) addPrice('TWD', next);
                     if (/^[\u00A5\uFFE5]$/.test(line) && next) addPrice('JPY', next);
@@ -1891,6 +1903,13 @@ async def _scrape_mercari_marketplace(
                 else:
                     twd_hkd_rate = twd_hkd_rate or await _get_twd_hkd_rate()
                     normalized_price = _usd_to_twd(float(raw_price), twd_hkd_rate, rates)
+            elif price_currency == "HKD":
+                rates = rates or await _get_rates()
+                if currency == "JPY":
+                    normalized_price = _hkd_to_jpy(float(raw_price), rates)
+                else:
+                    twd_hkd_rate = twd_hkd_rate or await _get_twd_hkd_rate()
+                    normalized_price = _hkd_to_twd(float(raw_price), twd_hkd_rate)
             else:
                 normalized_price = int(round(float(raw_price)))
             listing = {
