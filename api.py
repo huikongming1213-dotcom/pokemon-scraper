@@ -1770,7 +1770,12 @@ async def _scrape_mercari_marketplace(
     referer: str,
     sold_tokens: list[str],
 ) -> dict:
-    page = await _stealth_context.new_page()
+    context = await _browser.new_context(
+        user_agent=_STEALTH_UA,
+        viewport={"width": 1280, "height": 800},
+        locale="ja-JP",
+    )
+    page = await context.new_page()
     try:
         await page.add_init_script(_CR_STEALTH_SCRIPT)
         await page.set_extra_http_headers({"Referer": referer})
@@ -1962,6 +1967,7 @@ async def _scrape_mercari_marketplace(
         raise RuntimeError(f"{marketplace} failed: {type(e).__name__}: {e}")
     finally:
         await page.close()
+        await context.close()
 
 
 async def _scrape_mercari_tw(card_number: str, card_name: str = "", rarity: str = "", game: str = "pokemon_tcg") -> dict:
