@@ -1759,6 +1759,108 @@ def _grouped_market_stats(listings: list[dict], *, price_key: str, prefix: str) 
     return by_grade, overall
 
 
+async def _extract_mercari_payload(page, sold_tokens: list[str]) -> dict:
+    return await page.evaluate(r"""(config) => {
+        const soldTokens = (config.soldTokens || []).map(token => token.toLowerCase());
+        const noisePatterns = [
+            /^HK\$\s*[\d,.]+$/i,
+            /^NT\$\s*[\d,]+$/i,
+            /^US\$\s*[\d,.]+$/i,
+            /^[\u00A5\uFFE5]\s*[\d,]+$/i,
+            /^[\d,]+\s*\u5186$/i,
+            /^(SOLD|Sold out|\u5df2\u552e\u51fa|\u58f2\u308a\u5207\u308c)$/i,
+        ];
+        const blockedText = (document.body.innerText || '').toLowerCase();
+        if (
+            blockedText.includes('access denied') ||
+            blockedText.includes('unusual traffic') ||
+            blockedText.includes('captcha') ||
+            blockedText.includes('verify you are human')
+        ) {
+            return { status: 'blocked', reason: 'challenge_page' };
+        }
+
+        const items = [];
+        const seen = new Set();
+        for (const link of Array.from(document.querySelectorAll('a[href*="/item/"]'))) {
+            const href = link.getAttribute('href') || '';
+            const abs = href ? new URL(href, location.origin).href : '';
+            if (!abs || seen.has(abs)) continue;
+            seen.add(abs);
+
+            let container = link;
+            for (let i = 0; i < 2 && container.parentElement; i++) {
+                container = container.parentElement;
+            }
+
+            const text = (link.innerText || container.innerText || '').replace(/\u00a0/g, ' ').trim();
+            if (!text) continue;
+
+            const prices = [];
+            const addPrice = (kind, raw) => {
+                if (!raw) return;
+                const normalized = String(raw).replace(/,/g, '').trim();
+                if (!normalized) return;
+                if (kind === 'USD' || kind === 'HKD') {
+                    const parsed = parseFloat(normalized);
+                    if (!Number.isNaN(parsed) && parsed > 0) prices.push({ kind, value: parsed });
+                    return;
+                }
+                if (/^\d+$/.test(normalized)) {
+                    const parsed = parseInt(normalized, 10);
+                    if (parsed > 0) prices.push({ kind, value: parsed });
+                }
+            };
+
+            const linesForPrice = text.split(/\n+/).map(line => line.replace(/\s+/g, ' ').trim()).filter(Boolean);
+            for (let i = 0; i < linesForPrice.length; i++) {
+                const line = linesForPrice[i];
+                const next = linesForPrice[i + 1] || '';
+                const twInline = line.match(/NT\$\s*([\d,]+)/i);
+                if (twInline) addPrice('TWD', twInline[1]);
+                const hkInline = line.match(/HK\$\s*([\d,.]+)/i);
+                if (hkInline) addPrice('HKD', hkInline[1]);
+                const jpInline = line.match(/[\u00A5\uFFE5]\s*([\d,]+)/i) || line.match(/([\d,]+)\s*\u5186/i);
+                if (jpInline) addPrice('JPY', jpInline[1]);
+                const usdInline = line.match(/US\$\s*([\d,.]+)/i);
+                if (usdInline) addPrice('USD', usdInline[1]);
+                if (/^HK\$$/i.test(line) && next) addPrice('HKD', next);
+                if (/^US\$$/i.test(line) && next) addPrice('USD', next);
+                if (/^NT\$$/i.test(line) && next) addPrice('TWD', next);
+                if (/^[\u00A5\uFFE5]$/.test(line) && next) addPrice('JPY', next);
+                if (/^\u5186$/.test(line) && next) addPrice('JPY', next);
+                if (prices.length >= 3) break;
+            }
+
+            const chosenPrice = prices[0] || null;
+            if (!chosenPrice) continue;
+
+            const lowerText = text.toLowerCase();
+            const isSold = soldTokens.some(token => lowerText.includes(token));
+            const imgAlt = link.querySelector('img[alt]')?.getAttribute('alt')?.trim() || '';
+            const aria = link.getAttribute('aria-label')?.trim() || '';
+            const lines = text
+                .split(/\n+/)
+                .map(line => line.replace(/\s+/g, ' ').trim())
+                .filter(line => line)
+                .filter(line => !noisePatterns.some(pattern => pattern.test(line)));
+            const title = (imgAlt || aria || lines[0] || '').replace(/\s+\u306e\u30b5\u30e0\u30cd\u30a4\u30eb$/, '').trim();
+            if (!title) continue;
+
+            items.push({
+                url: abs,
+                name: title,
+                price: chosenPrice.value,
+                price_currency: chosenPrice.kind,
+                is_sold: isSold,
+            });
+            if (items.length >= 40) break;
+        }
+
+        return { status: 'ok', items };
+    }""", {"soldTokens": sold_tokens})
+
+
 async def _scrape_mercari_marketplace(
     *,
     base_url: str,
@@ -1788,109 +1890,27 @@ async def _scrape_mercari_marketplace(
             wait_until="domcontentloaded",
             timeout=25000,
         )
-        await page.wait_for_timeout(2200)
-        await page.mouse.wheel(0, 1400)
-        await page.wait_for_timeout(1200)
-
-        payload = await page.evaluate(r"""(config) => {
-            const soldTokens = (config.soldTokens || []).map(token => token.toLowerCase());
-            const noisePatterns = [
-                /^HK\$\s*[\d,.]+$/i,
-                /^NT\$\s*[\d,]+$/i,
-                /^US\$\s*[\d,.]+$/i,
-                /^[\u00A5\uFFE5]\s*[\d,]+$/i,
-                /^[\d,]+\s*\u5186$/i,
-                /^(SOLD|Sold out|\u5df2\u552e\u51fa|\u58f2\u308a\u5207\u308c)$/i,
-            ];
-            const blockedText = (document.body.innerText || '').toLowerCase();
-            if (
-                blockedText.includes('access denied') ||
-                blockedText.includes('unusual traffic') ||
-                blockedText.includes('captcha') ||
-                blockedText.includes('verify you are human')
-            ) {
-                return { status: 'blocked', reason: 'challenge_page' };
-            }
-
-            const items = [];
-            const seen = new Set();
-            for (const link of Array.from(document.querySelectorAll('a[href*="/item/"]'))) {
-                const href = link.getAttribute('href') || '';
-                const abs = href ? new URL(href, location.origin).href : '';
-                if (!abs || seen.has(abs)) continue;
-                seen.add(abs);
-
-                let container = link;
-                for (let i = 0; i < 2 && container.parentElement; i++) {
-                    container = container.parentElement;
-                }
-
-                const text = (link.innerText || container.innerText || '').replace(/\u00a0/g, ' ').trim();
-                if (!text) continue;
-
-                const prices = [];
-                const addPrice = (kind, raw) => {
-                    if (!raw) return;
-                    const normalized = String(raw).replace(/,/g, '').trim();
-                    if (!normalized) return;
-                    if (kind === 'USD') {
-                        const parsed = parseFloat(normalized);
-                        if (!Number.isNaN(parsed) && parsed > 0) prices.push({ kind, value: parsed });
-                        return;
-                    }
-                    if (/^\d+$/.test(normalized)) {
-                        const parsed = parseInt(normalized, 10);
-                        if (parsed > 0) prices.push({ kind, value: parsed });
-                    }
-                };
-
-                const linesForPrice = text.split(/\n+/).map(line => line.replace(/\s+/g, ' ').trim()).filter(Boolean);
-                for (let i = 0; i < linesForPrice.length; i++) {
-                    const line = linesForPrice[i];
-                    const next = linesForPrice[i + 1] || '';
-                    const twInline = line.match(/NT\$\s*([\d,]+)/i);
-                    if (twInline) addPrice('TWD', twInline[1]);
-                    const hkInline = line.match(/HK\$\s*([\d,.]+)/i);
-                    if (hkInline) addPrice('HKD', hkInline[1]);
-                    const jpInline = line.match(/[\u00A5\uFFE5]\s*([\d,]+)/i) || line.match(/([\d,]+)\s*\u5186/i);
-                    if (jpInline) addPrice('JPY', jpInline[1]);
-                    const usdInline = line.match(/US\$\s*([\d,.]+)/i);
-                    if (usdInline) addPrice('USD', usdInline[1]);
-                    if (/^HK\$$/i.test(line) && next) addPrice('HKD', next);
-                    if (/^US\$$/i.test(line) && next) addPrice('USD', next);
-                    if (/^NT\$$/i.test(line) && next) addPrice('TWD', next);
-                    if (/^[\u00A5\uFFE5]$/.test(line) && next) addPrice('JPY', next);
-                    if (/^\u5186$/.test(line) && next) addPrice('JPY', next);
-                    if (prices.length >= 3) break;
-                }
-
-                const chosenPrice = prices[0] || null;
-                if (!chosenPrice) continue;
-
-                const lowerText = text.toLowerCase();
-                const isSold = soldTokens.some(token => lowerText.includes(token));
-                const imgAlt = link.querySelector('img[alt]')?.getAttribute('alt')?.trim() || '';
-                const aria = link.getAttribute('aria-label')?.trim() || '';
-                const lines = text
-                    .split(/\n+/)
-                    .map(line => line.replace(/\s+/g, ' ').trim())
-                    .filter(line => line)
-                    .filter(line => !noisePatterns.some(pattern => pattern.test(line)));
-                const title = (imgAlt || aria || lines[0] || '').replace(/\s+\u306e\u30b5\u30e0\u30cd\u30a4\u30eb$/, '').trim();
-                if (!title) continue;
-
-                items.push({
-                    url: abs,
-                    name: title,
-                    price: chosenPrice.value,
-                    price_currency: chosenPrice.kind,
-                    is_sold: isSold,
-                });
-                if (items.length >= 40) break;
-            }
-
-            return { status: 'ok', items };
-        }""", {"currency": currency, "soldTokens": sold_tokens})
+        payload = {"status": "no_results", "items": []}
+        for attempt in range(2):
+            if attempt == 0:
+                await page.wait_for_timeout(2200)
+                await page.mouse.wheel(0, 1400)
+                await page.wait_for_timeout(1200)
+            else:
+                await page.wait_for_timeout(2600)
+                await page.mouse.wheel(0, 2600)
+                await page.wait_for_timeout(1800)
+            try:
+                await page.wait_for_selector('a[href*="/item/"]', timeout=8000)
+            except Exception:
+                pass
+            payload = await _extract_mercari_payload(page, sold_tokens)
+            if payload.get("status") == "blocked":
+                if attempt == 0:
+                    continue
+                return payload
+            if payload.get("items"):
+                break
 
         if payload.get("status") == "blocked":
             return payload
@@ -2317,25 +2337,25 @@ async def price_report(req: PriceReportRequest):
     if _is_one_piece_game(game):
         yuyu = {}
         rush = {}
-        snkr, magi, yahoo, merc_jp, merc_tw, bigweb = await asyncio.gather(
+        snkr, magi, yahoo, bigweb = await asyncio.gather(
             _safe(_scrape_snkr_dunk(card_number, query_name, rarity, game), "snkr_dunk", timeout=20),
             _safe(_scrape_magi(card_number, query_name, rarity, game), "magi", timeout=40),
             _safe(_scrape_yahoo_auctions(card_number, query_name, rarity, game), "yahoo_auctions", timeout=40),
-            _safe(_scrape_mercari_jp(card_number, query_name, rarity, game), "mercari_jp", timeout=45),
-            _safe(_scrape_mercari_tw(card_number, query_name, rarity, game), "mercari_tw", timeout=45),
             _safe(_scrape_bigweb_one_piece(card_number, query_name, rarity, game), "bigweb", timeout=20),
         )
+        merc_jp = await _safe(_scrape_mercari_jp(card_number, query_name, rarity, game), "mercari_jp", timeout=55)
+        merc_tw = await _safe(_scrape_mercari_tw(card_number, query_name, rarity, game), "mercari_tw", timeout=55)
     else:
         bigweb = {}
-        yuyu, snkr, rush, magi, yahoo, merc_jp, merc_tw = await asyncio.gather(
+        yuyu, snkr, rush, magi, yahoo = await asyncio.gather(
             _safe(_scrape_yuyu_tei(card_number, query_name, rarity, game), "yuyu_tei", timeout=35),
             _safe(_scrape_snkr_dunk(card_number, query_name, rarity, game), "snkr_dunk", timeout=20),
             _safe(_scrape_card_rush(card_number, query_name, game), "card_rush", timeout=120),
             _safe(_scrape_magi(card_number, query_name, rarity, game), "magi", timeout=40),
             _safe(_scrape_yahoo_auctions(card_number, query_name, rarity, game), "yahoo_auctions", timeout=40),
-            _safe(_scrape_mercari_jp(card_number, query_name, rarity, game), "mercari_jp", timeout=45),
-            _safe(_scrape_mercari_tw(card_number, query_name, rarity, game), "mercari_tw", timeout=45),
         )
+        merc_jp = await _safe(_scrape_mercari_jp(card_number, query_name, rarity, game), "mercari_jp", timeout=55)
+        merc_tw = await _safe(_scrape_mercari_tw(card_number, query_name, rarity, game), "mercari_tw", timeout=55)
 
     # ── 組裝 sources ──
     def _yuyu_out(r):
