@@ -202,6 +202,22 @@ _LLM_SOURCE_PRIORITY = {
 }
 
 
+def _llm_listing_priority(listing: dict, *, prioritize_psa: bool = False) -> tuple[int, int]:
+    if not prioritize_psa:
+        return (9, 0)
+    grade = _normalize_grade(listing.get("grade") or "raw")
+    if grade.startswith("PSA"):
+        try:
+            return (0, -int(grade.replace("PSA", "")))
+        except ValueError:
+            return (0, 0)
+    if grade.startswith("BGS") or grade.startswith("CGC") or grade.startswith("ARS") or grade.startswith("PCG"):
+        return (1, 0)
+    if grade in {"A", "B", "C", "D"}:
+        return (2, {"A": 0, "B": 1, "C": 2, "D": 3}.get(grade, 9))
+    return (3, 0)
+
+
 # ── Grade normalization ────────────────────────────────────────────────────
 
 def _normalize_grade(grade: str) -> str:
@@ -769,6 +785,7 @@ async def _normalize_listings_with_llm(source_key: str, listings: list[tuple[int
 
 async def _apply_llm_normalizer(sources: dict, identity: dict, errors: dict) -> dict:
     settings = _llm_normalizer_settings()
+    prioritize_psa = (identity.get("quote_requirements") or {}).get("grading_type") == "psa"
     debug = {
         "enabled": settings["enabled"],
         "configured_sources": sorted(settings["sources"]),
@@ -800,7 +817,13 @@ async def _apply_llm_normalizer(sources: dict, identity: dict, errors: dict) -> 
         debug["skipped_reason"] = "no_candidates"
         return debug
 
-    candidates.sort(key=lambda item: (_LLM_SOURCE_PRIORITY.get(item[0], 99), item[1]))
+    candidates.sort(
+        key=lambda item: (
+            _LLM_SOURCE_PRIORITY.get(item[0], 99),
+            *_llm_listing_priority(item[2], prioritize_psa=prioritize_psa),
+            item[1],
+        )
+    )
     candidates = candidates[:settings["max_listings"]]
     debug["selected_count"] = len(candidates)
     grouped: dict[str, list[tuple[int, dict]]] = {}
