@@ -2615,8 +2615,8 @@ def _fmt_tg(card_label, ts, sources, price_points, summary, req, errors) -> str:
     requirements = _quote_requirements(req)
     intent_label = {"buy": "客人想買", "sell": "客人想賣"}.get(requirements["intent"], "買賣方向未確認")
     lines = [
-        "🔎 <b>市場價格快照（老細覆核）</b>",
-        f"卡：<b>{card_label}</b>",
+        "🔎 市場價格快照（老細覆核）",
+        f"卡：{card_label}",
         f"需求：{intent_label}｜{requirements['label']}",
         f"更新：{ts.strftime('%m-%d %H:%M')} HKT",
     ]
@@ -2653,7 +2653,7 @@ def _fmt_tg(card_label, ts, sources, price_points, summary, req, errors) -> str:
             _rpad(n, C) + _rpad(str(lo), 8) + _rpad(str(hi), 8) + str(avg)
             for n, lo, hi, avg in rows
         ]
-        lines += ["", "✅ 已核對、符合條件", "<pre>" + "\n".join(tbl) + "</pre>"]
+        lines += ["", "✅ 已核對、符合條件", "\n".join(tbl)]
         detail_lines = []
         for index, point in enumerate(eligible_points, 1):
             source_label = source_labels.get(point["source"], point["source"])
@@ -2661,7 +2661,7 @@ def _fmt_tg(card_label, ts, sources, price_points, summary, req, errors) -> str:
             grade_label = "RAW" if grade == "raw" else grade
             listed_label, age_label = _format_listing_time(point)
             detail_lines.extend([
-                f"{index}. <b>{source_label}</b>｜{grade_label}｜HK${point['price_hkd']:,}",
+                f"{index}. {source_label}｜{grade_label}｜HK${point['price_hkd']:,}",
                 f"   上架時間：{listed_label}｜已上架：{age_label}",
             ])
         lines += ["", "📋 基準樣本明細", *detail_lines]
@@ -2728,7 +2728,7 @@ def _fmt_tg(card_label, ts, sources, price_points, summary, req, errors) -> str:
         icon = {"high": "🟢", "medium": "🟡", "low": "🟠"}.get(summary.get("confidence"), "⚪")
         lines += [
             "",
-            f"📊 市場基準：<b>HK${summary.get('market_base_hkd', 0):,}</b>（{summary.get('basis', 'n/a')}）",
+            f"📊 市場基準：HK${summary.get('market_base_hkd', 0):,}（{summary.get('basis', 'n/a')}）",
             f"試算買入：HK${summary['recommended_buy']:,}｜試算賣出：HK${summary['recommended_sell']:,}",
             f"來源：{summary.get('source_count', 0)} 個網站｜信心度：{icon} {summary['confidence'].upper()}",
             "⚠️ 試算只供老細參考，最終由老細手動報價俾客。",
