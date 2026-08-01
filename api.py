@@ -1292,6 +1292,20 @@ _SNKR_HEADERS = {
 }
 
 
+def _listing_time_fields(item: dict) -> dict:
+    """Keep marketplace-provided timestamp aliases without guessing dates."""
+    aliases = {
+        "listed_at": ("listed_at", "listedAt", "listing_date", "listingDate", "start_time", "startTime"),
+        "posted_at": ("posted_at", "postedAt", "post_date", "postDate"),
+        "created_at": ("created_at", "createdAt", "created_date", "createdDate"),
+        "published_at": ("published_at", "publishedAt", "published_date", "publishedDate"),
+    }
+    return {
+        target: next((item.get(key) for key in keys if item.get(key) not in (None, "")), None)
+        for target, keys in aliases.items()
+    }
+
+
 def _grade_stats(listings: list[dict], grade_key: str) -> dict | None:
     items = [l for l in listings if l["grade"] == grade_key]
     if not items:
@@ -1336,6 +1350,7 @@ async def _scrape_snkr_dunk(card_number: str, card_name: str = "", rarity: str =
             # FIX: normalize grade 格式，統一 "PSA 10" → "PSA10" 等
             "grade":     _normalize_grade(p.get("condition") or "raw"),
             "name":      p.get("title", ""),
+            **_listing_time_fields(p),
         }
         for p in products
         if p.get("salePrice", 0) > 0
@@ -1485,6 +1500,7 @@ async def _scrape_card_rush(card_number: str, card_name: str = "", game: str = "
             "grade":     _parse_cr_grade(item.get("name", "")),
             "in_stock":  item.get("stock", "") != "×" and "在庫" in item.get("stock", ""),
             "name":      item.get("name", ""),
+            **_listing_time_fields(item),
         })
 
     if not listings:
@@ -1557,7 +1573,16 @@ async def _scrape_magi(card_number: str, card_name: str = "", rarity: str = "", 
                     const name = box.querySelector('.item-list__item-name')?.textContent?.trim() || '';
                     const priceText = box.querySelector('.item-list__price-box--price')?.textContent || '';
                     const price = parseInt(priceText.replace(/[^0-9]/g, ''), 10) || 0;
-                    return { name, price_jpy: price, url: link?.href || '' };
+                    const timeEl = box.querySelector('time,[datetime],[data-listed-at],[data-posted-at],[data-created-at],[data-published-at]');
+                    return {
+                        name,
+                        price_jpy: price,
+                        url: link?.href || '',
+                        listed_at: timeEl?.getAttribute('data-listed-at') || null,
+                        posted_at: timeEl?.getAttribute('data-posted-at') || null,
+                        created_at: timeEl?.getAttribute('data-created-at') || timeEl?.getAttribute('datetime') || null,
+                        published_at: timeEl?.getAttribute('data-published-at') || null,
+                    };
                 }).filter(item => item.name && item.price_jpy > 0 && item.url);
             }""")
             raw_items.extend({**item, "status": status} for item in status_items)
@@ -1573,6 +1598,7 @@ async def _scrape_magi(card_number: str, card_name: str = "", rarity: str = "", 
             listings.append({
                 **item,
                 "grade": f"PSA{psa.group(1)}" if psa else "raw",
+                **_listing_time_fields(item),
             })
 
         if not listings:
@@ -1651,12 +1677,18 @@ async def _scrape_yahoo_auctions(card_number: str, card_name: str = "", rarity: 
             if not title:
                 continue
 
+            date_match = (
+                re.search(r'data-(?:start|listed|created)-at="([^"]+)"', attrs, re.IGNORECASE)
+                or re.search(r'<time[^>]+datetime="([^"]+)"', body, re.IGNORECASE)
+            )
+
             raw_items.append({
                 "url": absolute_url,
                 "name": title,
                 "price_jpy": int(digits),
                 "is_flea": 'data-auction-isflea="' in attrs.lower(),
                 "is_free_shipping": 'data-auction-isfreeshipping="' in attrs.lower(),
+                "listed_at": date_match.group(1) if date_match else None,
             })
             if len(raw_items) >= 40:
                 break
@@ -1886,12 +1918,19 @@ async def _extract_mercari_payload(page, sold_tokens: list[str]) -> dict:
             const title = (imgAlt || aria || lines[0] || '').replace(/\s+\u306e\u30b5\u30e0\u30cd\u30a4\u30eb$/, '').trim();
             if (!title) continue;
 
+            const dateElement = container.querySelector('time,[datetime],[data-listed-at],[data-posted-at],[data-created-at],[data-published-at]');
+            const dateValue = (attribute) => dateElement?.getAttribute(attribute) || null;
+
             items.push({
                 url: abs,
                 name: title,
                 price: chosenPrice.value,
                 price_currency: chosenPrice.kind,
                 is_sold: isSold,
+                listed_at: dateValue('data-listed-at'),
+                posted_at: dateValue('data-posted-at'),
+                created_at: dateValue('data-created-at') || dateValue('datetime'),
+                published_at: dateValue('data-published-at'),
             });
             if (items.length >= 40) break;
         }
@@ -1990,6 +2029,7 @@ async def _scrape_mercari_marketplace(
                 "url": item.get("url", ""),
                 "grade": f"PSA{psa_match.group(1)}" if psa_match else "raw",
                 "status": "sold" if item.get("is_sold") else "active",
+                **_listing_time_fields(item),
             }
             if currency == "TWD":
                 listing["price_twd"] = normalized_price
