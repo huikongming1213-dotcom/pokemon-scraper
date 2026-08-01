@@ -1001,13 +1001,19 @@ def _collect_price_points(sources: dict, req, identity: dict) -> list[dict]:
     requirements = _quote_requirements(req)
 
     if sources.get("yuyu_tei"):
+        source = sources["yuyu_tei"]
         points.append({
             "source": "yuyu_tei",
             "grade": "raw",
             "raw_condition": None,
             "status": "shop_price",
             "metric": "single",
-            "price_hkd": sources["yuyu_tei"]["price_hkd"],
+            "price_hkd": source["price_hkd"],
+            "url": source.get("url"),
+            "listed_at": source.get("listed_at"),
+            "posted_at": source.get("posted_at"),
+            "created_at": source.get("created_at"),
+            "published_at": source.get("published_at"),
             "count": 1,
             "match_score": 7,
             "match_reasons": ["dedicated_card_shop", "card_number"],
@@ -1045,6 +1051,11 @@ def _collect_price_points(sources: dict, req, identity: dict) -> list[dict]:
                 "status": listing.get("status", "active"),
                 "metric": "listing",
                 "price_hkd": listing["price_hkd"],
+                "url": listing.get("url"),
+                "listed_at": listing.get("listed_at"),
+                "posted_at": listing.get("posted_at"),
+                "created_at": listing.get("created_at"),
+                "published_at": listing.get("published_at"),
                 "count": 1,
                 "name": listing.get("name", ""),
                 "match_score": match["score"],
@@ -1066,6 +1077,11 @@ def _collect_price_points(sources: dict, req, identity: dict) -> list[dict]:
                     "status": "active",
                     "metric": "avg",
                     "price_hkd": stats["avg_hkd"],
+                    "url": None,
+                    "listed_at": None,
+                    "posted_at": None,
+                    "created_at": None,
+                    "published_at": None,
                     "count": stats.get("count", 1),
                     "match_score": 0,
                     "match_reasons": ["aggregate_without_listing_identity"],
@@ -2387,6 +2403,11 @@ async def price_report(req: PriceReportRequest):
             "price_jpy": r["price_jpy"],
             "price_hkd": _jpy_to_hkd(r["price_jpy"], rates),
             "name": r.get("name"),
+            "url": r.get("url"),
+            "listed_at": r.get("listed_at"),
+            "posted_at": r.get("posted_at"),
+            "created_at": r.get("created_at"),
+            "published_at": r.get("published_at"),
             "currency": "JPY",
             "grading_scope": "raw_only",
             "trust": "verified_card_shop",
@@ -2535,6 +2556,62 @@ def _fmt_tg(card_label, ts, sources, price_points, summary, req, errors) -> str:
     def _rpad(s: str, w: int) -> str:
         return s + ' ' * max(0, w - _dw(s))
 
+    def _parse_listing_time(value) -> datetime | None:
+        parsed = None
+        if isinstance(value, datetime):
+            parsed = value
+        elif isinstance(value, (int, float)):
+            seconds = value / 1000 if abs(value) >= 10_000_000_000 else value
+            try:
+                parsed = datetime.fromtimestamp(seconds, timezone.utc)
+            except (OSError, OverflowError, ValueError):
+                return None
+        elif isinstance(value, str):
+            raw = value.strip()
+            if not raw:
+                return None
+            if re.fullmatch(r"-?\d+(?:\.\d+)?", raw):
+                return _parse_listing_time(float(raw))
+            normalized = raw[:-1] + "+00:00" if raw.endswith(("Z", "z")) else raw
+            try:
+                parsed = datetime.fromisoformat(normalized)
+            except ValueError:
+                return None
+
+        if parsed is None:
+            return None
+        if parsed.tzinfo is None:
+            parsed = parsed.replace(tzinfo=HKT)
+        return parsed.astimezone(HKT)
+
+    def _format_listing_time(point: dict) -> tuple[str, str]:
+        value = next((point.get(key) for key in ("listed_at", "posted_at", "created_at", "published_at") if point.get(key) not in (None, "")), None)
+        if value is None:
+            return "未提供", "未提供"
+
+        parsed = _parse_listing_time(value)
+        if parsed is None:
+            return str(value), "未提供"
+
+        listed_label = parsed.strftime("%Y-%m-%d %H:%M HKT")
+        current = ts if ts.tzinfo else ts.replace(tzinfo=HKT)
+        elapsed_seconds = int((current.astimezone(HKT) - parsed).total_seconds())
+        if elapsed_seconds < 0:
+            return listed_label, "未到上架時間"
+        if elapsed_seconds < 60:
+            return listed_label, "少於 1 分鐘"
+
+        minutes = elapsed_seconds // 60
+        days, remaining_minutes = divmod(minutes, 24 * 60)
+        hours, remaining_minutes = divmod(remaining_minutes, 60)
+        if days:
+            age_label = f"{days} 日 {hours} 小時" if hours else f"{days} 日"
+        elif hours:
+            age_label = f"{hours} 小時 {remaining_minutes} 分鐘" if remaining_minutes else f"{hours} 小時"
+        else:
+            age_label = f"{remaining_minutes} 分鐘"
+        return listed_label, age_label
+
     requirements = _quote_requirements(req)
     intent_label = {"buy": "客人想買", "sell": "客人想賣"}.get(requirements["intent"], "買賣方向未確認")
     lines = [
@@ -2554,10 +2631,12 @@ def _fmt_tg(card_label, ts, sources, price_points, summary, req, errors) -> str:
         "mercari_jp": "Mercari JP",
         "mercari_tw": "Mercari TW",
     }
+    eligible_points = [
+        point for point in price_points
+        if point.get("baseline_eligible") and point.get("price_hkd")
+    ]
     grouped: dict[tuple[str, str], list[int]] = {}
-    for point in price_points:
-        if not point.get("baseline_eligible") or not point.get("price_hkd"):
-            continue
+    for point in eligible_points:
         grade = point.get("grade", "raw")
         grouped.setdefault((point["source"], grade), []).append(point["price_hkd"])
 
@@ -2575,6 +2654,17 @@ def _fmt_tg(card_label, ts, sources, price_points, summary, req, errors) -> str:
             for n, lo, hi, avg in rows
         ]
         lines += ["", "✅ 已核對、符合條件", "<pre>" + "\n".join(tbl) + "</pre>"]
+        detail_lines = []
+        for index, point in enumerate(eligible_points, 1):
+            source_label = source_labels.get(point["source"], point["source"])
+            grade = point.get("grade", "raw")
+            grade_label = "RAW" if grade == "raw" else grade
+            listed_label, age_label = _format_listing_time(point)
+            detail_lines.extend([
+                f"{index}. <b>{source_label}</b>｜{grade_label}｜HK${point['price_hkd']:,}",
+                f"   上架時間：{listed_label}｜已上架：{age_label}",
+            ])
+        lines += ["", "📋 基準樣本明細", *detail_lines]
     else:
         lines += ["", "⚠️ 暫時冇已核對、符合條件嘅市場樣本"]
 
