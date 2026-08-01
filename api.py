@@ -53,30 +53,39 @@ async def lifespan(app: FastAPI):
 app = FastAPI(title="Pokemon Card Price Scraper", lifespan=lifespan)
 
 
-# ── Exchange rate (1hr cache, no Lock needed in single-threaded asyncio) ───
+# ── Exchange rate (cache only successful fetches; no silent fallback) ──────
 
 _rate_cache: dict = {}
-RATE_FALLBACK = {"JPY_HKD": 0.052, "USD_HKD": 7.8}
 _llm_listing_cache: dict[tuple[str, ...], dict] = {}
 _LLM_LISTING_CACHE_MAX = 1000
 
 
 async def _get_rates() -> dict:
-    if _rate_cache.get("ts") and time.time() - _rate_cache["ts"] < 3600:
+    ttl_minutes = _env_nonnegative_int("EXCHANGE_RATE_CACHE_MINUTES", 60)
+    if (
+        ttl_minutes > 0
+        and _rate_cache.get("ts")
+        and time.time() - _rate_cache["ts"] < ttl_minutes * 60
+    ):
         return _rate_cache["rates"]
     try:
         async with httpx.AsyncClient(timeout=8) as client:
             r = await client.get("https://api.exchangerate-api.com/v4/latest/JPY")
             r.raise_for_status()
             d = r.json()["rates"]
+            jpy_hkd = float(d["HKD"])
+            usd_hkd = jpy_hkd / float(d["USD"])
+            if jpy_hkd <= 0 or usd_hkd <= 0:
+                raise ValueError("exchange rate response contains non-positive rates")
             rates = {
-                "JPY_HKD": d.get("HKD", 0.052),
-                "USD_HKD": d.get("HKD", 7.8) / d.get("USD", 1),
+                "JPY_HKD": jpy_hkd,
+                "USD_HKD": usd_hkd,
             }
             _rate_cache.update({"rates": rates, "ts": time.time()})
             return rates
-    except Exception:
-        return RATE_FALLBACK
+    except Exception as exc:
+        _rate_cache.clear()
+        raise RuntimeError(f"exchange rate fetch failed: {type(exc).__name__}") from exc
 
 
 def _jpy_to_hkd(jpy: int, rates: dict) -> int:
@@ -2394,7 +2403,10 @@ async def price_report(req: PriceReportRequest):
             return {}
 
     identity = _normalize_card_identity(req)
-    rates = await _get_rates()
+    try:
+        rates = await _get_rates()
+    except RuntimeError as exc:
+        raise HTTPException(status_code=503, detail=str(exc)) from exc
 
     # FIX: 全部 scraper 都傳入 rarity；日站優先用 normalized 日文名查詢
     query_name = identity["query_name"]
