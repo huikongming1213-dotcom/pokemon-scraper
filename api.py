@@ -16,7 +16,7 @@ from urllib.parse import quote
 import httpx
 from fastapi import FastAPI, HTTPException, Query
 from playwright.async_api import async_playwright, Playwright
-from pydantic import BaseModel
+from pydantic import BaseModel, Field
 
 
 # ── Browser lifecycle ──────────────────────────────────────────────────────
@@ -57,7 +57,8 @@ app = FastAPI(title="Pokemon Card Price Scraper", lifespan=lifespan)
 
 _rate_cache: dict = {}
 RATE_FALLBACK = {"JPY_HKD": 0.052, "USD_HKD": 7.8}
-_llm_listing_cache: dict = {}
+_llm_listing_cache: dict[tuple[str, ...], dict] = {}
+_LLM_LISTING_CACHE_MAX = 1000
 
 
 async def _get_rates() -> dict:
@@ -107,6 +108,16 @@ def _env_flag(name: str, default: bool = False) -> bool:
     return raw.strip().lower() in {"1", "true", "yes", "on"}
 
 
+def _env_nonnegative_int(name: str, default: int) -> int:
+    raw = os.getenv(name)
+    if raw is None:
+        return default
+    try:
+        return max(0, int(raw))
+    except ValueError:
+        return default
+
+
 def _llm_normalizer_settings() -> dict:
     api_key = (os.getenv("OPENAI_API_KEY") or os.getenv("OPENROUTER_API_KEY") or "").strip()
     base_url = (
@@ -126,7 +137,7 @@ def _llm_normalizer_settings() -> dict:
         "api_key": api_key,
         "base_url": base_url,
         "model": model,
-        "max_listings": max(0, _clean_int(os.getenv("LLM_LISTING_NORMALIZER_MAX_LISTINGS")) or 12),
+        "max_listings": _env_nonnegative_int("LLM_LISTING_NORMALIZER_MAX_LISTINGS", 12),
         "confidence_threshold": min(1.0, max(0.0, float(os.getenv("LLM_LISTING_NORMALIZER_MIN_CONFIDENCE", "0.8")))),
         "sources": sources,
     }
@@ -192,6 +203,25 @@ def _llm_error_label(exc: Exception) -> str:
             body = _strip_html(exc.response.text or "")[:180]
         return f"HTTPStatusError {status}: {body}".strip()
     return type(exc).__name__
+
+
+def _llm_listing_cache_key(source_key: str, title: str, identity: dict) -> tuple[str, ...]:
+    return (
+        source_key,
+        title,
+        identity.get("game", ""),
+        identity.get("query_name", ""),
+        identity.get("card_number", ""),
+        identity.get("set_code", ""),
+        identity.get("rarity", ""),
+    )
+
+
+def _cache_llm_listing(cache_key: tuple[str, ...], normalized: dict) -> None:
+    _llm_listing_cache.pop(cache_key, None)
+    _llm_listing_cache[cache_key] = normalized
+    while len(_llm_listing_cache) > _LLM_LISTING_CACHE_MAX:
+        _llm_listing_cache.pop(next(iter(_llm_listing_cache)))
 
 
 _LLM_SOURCE_PRIORITY = {
@@ -611,7 +641,7 @@ async def _normalize_listings_with_llm(source_key: str, listings: list[tuple[int
         title = (listing.get("name") or "").strip()
         if not title:
             continue
-        cache_key = f"{source_key}|{title}"
+        cache_key = _llm_listing_cache_key(source_key, title, identity)
         cached = _llm_listing_cache.get(cache_key)
         if cached is not None:
             listing["llm_normalized"] = cached
@@ -771,7 +801,12 @@ async def _normalize_listings_with_llm(source_key: str, listings: list[tuple[int
             "trusted": float(item.get("confidence") or 0) >= settings["confidence_threshold"],
         }
         listing["llm_normalized"] = normalized
-        _llm_listing_cache[f"{source_key}|{(listing.get('name') or '').strip()}"] = normalized
+        cache_key = _llm_listing_cache_key(
+            source_key,
+            (listing.get("name") or "").strip(),
+            identity,
+        )
+        _cache_llm_listing(cache_key, normalized)
         normalized_count += 1
         if normalized["trusted"]:
             trusted_count += 1
@@ -1171,53 +1206,6 @@ def _build_summary(price_points: list[dict], req) -> dict | None:
     }
 
 
-# ── DEBUG endpoint (臨時用，睇真實 HTML 結構) ─────────────────────────────
-
-@app.get("/debug/html")
-async def debug_html(url: str = Query(...)):
-    """fetch 一個 URL，返回 rendered HTML + 所有含價格嘅文字，幫助 debug scraper selector"""
-    if _is_one_piece_game(game):
-        return {}
-    page = await _browser.new_page()
-    try:
-        await page.goto(url, wait_until="networkidle", timeout=30000)
-
-        body_text = await page.evaluate("() => document.body.innerText")
-        inner_html = await page.evaluate("() => document.body.innerHTML")
-
-        price_lines = [
-            line.strip() for line in body_text.split("\n")
-            if re.search(r"[¥￥円\$]|[\d,]{3,}", line) and line.strip()
-        ][:50]
-
-        all_classes = await page.evaluate("""() => {
-            const els = document.querySelectorAll('[class]');
-            const classes = new Set();
-            els.forEach(el => el.className.toString().split(' ').forEach(c => c && classes.add(c)));
-            return [...classes].filter(c => c.length > 2 && c.length < 50).slice(0, 100);
-        }""")
-
-        # 額外：dump 所有 input[name] 幫助識別 form fields
-        form_fields = await page.evaluate("""() => {
-            return [...document.querySelectorAll('input, select, textarea')]
-                .map(el => ({ tag: el.tagName, name: el.name, id: el.id, type: el.type, placeholder: el.placeholder }))
-                .filter(f => f.name || f.id);
-        }""")
-
-        return {
-            "url": url,
-            "title": await page.title(),
-            "price_lines": price_lines,
-            "all_classes": all_classes,
-            "form_fields": form_fields,
-            "html_snippet": inner_html[:3000],
-        }
-    except Exception as e:
-        return {"error": str(e), "url": url}
-    finally:
-        await page.close()
-
-
 # ── Helper: extract JPY prices from raw page text ─────────────────────────
 
 async def _page_prices(page, min_val=200, max_val=5_000_000) -> list[int]:
@@ -1382,7 +1370,7 @@ async def _scrape_snkr_dunk(card_number: str, card_name: str = "", rarity: str =
 
 # ── Scraper 3: Card Rush (Apify Cheerio + RESIDENTIAL proxy) ─────────────
 # FIX: URL 同時帶 keyword（卡名）同 keyword2（型番/卡號），對應兩個獨立搜尋欄
-# ⚠️  keyword2 係根據 Card Rush 表單結構估計，部署前請用 /debug/html 確認 field name
+# ⚠️  keyword2 係根據 Card Rush 表單結構估計，selector 變更時要用本地 HTML fixture 確認 field name
 
 _CR_STEALTH_SCRIPT = """
 Object.defineProperty(navigator, 'webdriver', {get: () => undefined});
@@ -1421,8 +1409,8 @@ async def _scrape_card_rush(card_number: str, card_name: str = "", game: str = "
     FIX: URL 帶兩個 field：
       - keyword  = カード名/商品名（卡名）
       - keyword2 = 型番（卡號）
-    ⚠️  請先用 /debug/html?url=https://www.cardrush-pokemon.jp/product-list
-        確認 form field name（name 屬性），如唔係 keyword/keyword2 請更新。
+    Marketplace markup 變更時，請用本地保存嘅 HTML fixture 確認 form field name；
+    生產環境不提供任意 URL debug endpoint。
     """
     if _is_one_piece_game(game):
         return {}
@@ -2377,18 +2365,18 @@ async def yuyu_tei_search(
 # ── POST /price-report ────────────────────────────────────────────────────
 
 class PriceReportRequest(BaseModel):
-    card_name:   str
-    card_number: str
-    set_name:    str = ""
-    rarity:      str = ""
-    game:        str = "pokemon_tcg"
-    intent:       str = ""
-    grading_type: str = ""
+    card_name:   str = Field(min_length=1, max_length=200)
+    card_number: str = Field(min_length=1, max_length=80)
+    set_name:    str = Field(default="", max_length=200)
+    rarity:      str = Field(default="", max_length=40)
+    game:        str = Field(default="pokemon_tcg", max_length=64)
+    intent:       str = Field(default="", max_length=20)
+    grading_type: str = Field(default="", max_length=20)
     is_psa:      bool = False
     psa_grade:   int | None = None
     min_psa_grade: int | None = None
-    card_condition: str | None = None
-    min_acceptable_condition: str | None = None
+    card_condition: str | None = Field(default=None, max_length=20)
+    min_acceptable_condition: str | None = Field(default=None, max_length=20)
 
 
 HKT = timezone(timedelta(hours=8))
